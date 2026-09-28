@@ -39,6 +39,16 @@ pnpm run dev
 
 Server runs on `http://localhost:3000`
 
+For the full Docker, environment, migration, seeding, IDE, debugging, and
+testing workflow, see [SETUP.md](./SETUP.md), [IDE.md](./docs/IDE.md),
+[DEBUGGING.md](./docs/DEBUGGING.md), and [TESTING.md](./docs/TESTING.md).
+
+The quickest reproducible setup is:
+
+```bash
+make setup
+```
+
 ## Development
 
 ### Build & Test
@@ -329,7 +339,6 @@ See `SECURITY.md` for:
 ## License
 
 MIT. See `LICENSE` for details.
-
 
 ## Platform additions (Issues #27–#30)
 
