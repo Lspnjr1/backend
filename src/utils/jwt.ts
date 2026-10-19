@@ -6,12 +6,16 @@ export interface JwtPayload extends BaseJwtPayload {
   userId: string;
   email: string;
   role: string;
+  authVersion?: number;
   jti?: string;
+  /** Session-bound CSRF synchronizer token (#191). */
+  csrf?: string;
 }
 
 export interface RefreshTokenPayload extends BaseJwtPayload {
   userId: string;
   jti: string;
+  authVersion?: number;
   iat: number;
 }
 
@@ -31,9 +35,9 @@ export const generateAccessToken = (payload: JwtPayload): string => {
 /**
  * Generate a long-lived refresh token
  */
-export const generateRefreshToken = (userId: string, jti: string): string => {
+export const generateRefreshToken = (userId: string, jti: string, authVersion = 0): string => {
   return jwt.sign(
-    { userId, jti } as RefreshTokenPayload,
+    { userId, jti, authVersion } as RefreshTokenPayload,
     config.JWT_SECRET as Secret,
     {
       expiresIn: config.JWT_REFRESH_EXPIRES_IN,

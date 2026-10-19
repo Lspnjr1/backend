@@ -3,12 +3,16 @@ import Fastify, { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { buildErrorResponse, globalErrorHandler, normalizeError, notFoundHandler } from '../error-handler';
 import {
-  AppError,
   ConflictError,
+  DuplicatePaymentError,
   ErrorCodes,
   ForbiddenError,
+  InsufficientFundsError,
   InternalServerError,
+  InvalidCurrencyError,
   NotFoundError,
+  PaymentDeclinedError,
+  PaymentNotFoundError,
   TooManyRequestsError,
   UnauthorizedError,
   ValidationError,
@@ -97,6 +101,26 @@ function buildApp(): FastifyInstance {
     throw new ValidationError('Contest is not open');
   });
 
+  app.get('/payment-insufficient-funds', async () => {
+    throw new InsufficientFundsError();
+  });
+
+  app.get('/payment-invalid-currency', async () => {
+    throw new InvalidCurrencyError('XYZ');
+  });
+
+  app.get('/payment-declined', async () => {
+    throw new PaymentDeclinedError();
+  });
+
+  app.get('/payment-duplicate', async () => {
+    throw new DuplicatePaymentError('Duplicate tip', { idempotencyKey: 'key-1' });
+  });
+
+  app.get('/payment-not-found', async () => {
+    throw new PaymentNotFoundError();
+  });
+
   return app;
 }
 
@@ -139,6 +163,11 @@ describe('global error handler', () => {
       ['/conflict', 409, ErrorCodes.CONFLICT],
       ['/rate-limit', 429, ErrorCodes.RATE_LIMIT_EXCEEDED],
       ['/prisma-down', 503, ErrorCodes.DATABASE_UNAVAILABLE],
+      ['/payment-insufficient-funds', 422, 'INSUFFICIENT_FUNDS'],
+      ['/payment-invalid-currency', 422, 'INVALID_CURRENCY'],
+      ['/payment-declined', 422, 'PAYMENT_DECLINED'],
+      ['/payment-duplicate', 409, 'DUPLICATE_PAYMENT'],
+      ['/payment-not-found', 404, 'PAYMENT_NOT_FOUND'],
     ];
 
     for (const [url, status, code] of cases) {
@@ -244,6 +273,70 @@ describe('global error handler', () => {
     expect(stats.total).toBe(2);
     expect(stats.byCode[ErrorCodes.VALIDATION_ERROR]).toBe(1);
     expect(stats.byCode[ErrorCodes.INTERNAL_ERROR]).toBe(1);
+  });
+});
+
+describe('payment-specific error classes', () => {
+  let app: FastifyInstance;
+
+  beforeEach(async () => {
+    resetErrorTracking();
+    app = buildApp();
+    await app.ready();
+  });
+
+  afterEach(async () => {
+    await app.close();
+  });
+
+  it('InsufficientFundsError returns 422 with INSUFFICIENT_FUNDS code', async () => {
+    const res = await app.inject({ method: 'GET', url: '/payment-insufficient-funds' });
+    expect(res.statusCode).toBe(422);
+    const body = res.json();
+    expect(body.error.code).toBe('INSUFFICIENT_FUNDS');
+    expect(body.error.message).toBeTruthy();
+  });
+
+  it('InvalidCurrencyError returns 422 with INVALID_CURRENCY code', async () => {
+    const res = await app.inject({ method: 'GET', url: '/payment-invalid-currency' });
+    expect(res.statusCode).toBe(422);
+    const body = res.json();
+    expect(body.error.code).toBe('INVALID_CURRENCY');
+    expect(body.error.message).toBeTruthy();
+  });
+
+  it('PaymentDeclinedError returns 422 with PAYMENT_DECLINED code', async () => {
+    const res = await app.inject({ method: 'GET', url: '/payment-declined' });
+    expect(res.statusCode).toBe(422);
+    const body = res.json();
+    expect(body.error.code).toBe('PAYMENT_DECLINED');
+    expect(body.error.message).toBeTruthy();
+  });
+
+  it('DuplicatePaymentError returns 409 with DUPLICATE_PAYMENT code and details', async () => {
+    const res = await app.inject({ method: 'GET', url: '/payment-duplicate' });
+    expect(res.statusCode).toBe(409);
+    const body = res.json();
+    expect(body.error.code).toBe('DUPLICATE_PAYMENT');
+    expect(body.error.message).toBeTruthy();
+    expect(body.error.details.idempotencyKey).toBe('key-1');
+  });
+
+  it('PaymentNotFoundError returns 404 with PAYMENT_NOT_FOUND code', async () => {
+    const res = await app.inject({ method: 'GET', url: '/payment-not-found' });
+    expect(res.statusCode).toBe(404);
+    const body = res.json();
+    expect(body.error.code).toBe('PAYMENT_NOT_FOUND');
+    expect(body.error.message).toBeTruthy();
+  });
+
+  it('payment errors never leak internal details', async () => {
+    const res = await app.inject({ method: 'GET', url: '/payment-declined' });
+    expect(res.statusCode).toBe(422);
+    const serialized = JSON.stringify(res.json());
+    expect(serialized).not.toContain('stack');
+    expect(serialized).not.toContain('.ts:');
+    expect(serialized).not.toContain('postgres://');
   });
 });
 

@@ -8,7 +8,8 @@
  */
 import { config } from './env';
 
-export type RateLimitClass = 'public' | 'authenticated' | 'sensitive';
+export type RateLimitClass = 'public' | 'authenticated' | 'sensitive' | 'walletNonce' | 'walletVerify';
+export type InternalRateLimitClass = 'internal';
 
 export interface RateLimitPolicy {
   /** Requests allowed per client, per route, within `timeWindowMs`. */
@@ -27,10 +28,10 @@ export interface RouteMatcher {
 }
 
 export interface RateLimitRule extends RouteMatcher {
-  class: RateLimitClass;
+  class: RateLimitClass | 'authLogin' | 'authRegister' | 'authRecovery';
 }
 
-export const RATE_LIMIT_POLICIES: Record<RateLimitClass, RateLimitPolicy> = {
+export const RATE_LIMIT_POLICIES: Record<string, RateLimitPolicy> = {
   public: {
     max: config.RATE_LIMIT_PUBLIC_MAX,
     timeWindowMs: config.RATE_LIMIT_PUBLIC_WINDOW_MS,
@@ -42,6 +43,17 @@ export const RATE_LIMIT_POLICIES: Record<RateLimitClass, RateLimitPolicy> = {
   sensitive: {
     max: config.RATE_LIMIT_SENSITIVE_MAX,
     timeWindowMs: config.RATE_LIMIT_SENSITIVE_WINDOW_MS,
+  },
+  authLogin: { max: 5, timeWindowMs: 5 * 60_000 },
+  authRegister: { max: 3, timeWindowMs: 60 * 60_000 },
+  authRecovery: { max: 3, timeWindowMs: 60 * 60_000 },
+  walletNonce: {
+    max: config.RATE_LIMIT_WALLET_NONCE_MAX,
+    timeWindowMs: config.RATE_LIMIT_WALLET_NONCE_WINDOW_MS,
+  },
+  walletVerify: {
+    max: config.RATE_LIMIT_WALLET_VERIFY_MAX,
+    timeWindowMs: config.RATE_LIMIT_WALLET_VERIFY_WINDOW_MS,
   },
 };
 
@@ -66,8 +78,10 @@ export const RATE_LIMIT_RULES: RateLimitRule[] = [
   { method: 'POST', url: '/api/v1/auth/login', class: 'sensitive' },
   { method: 'POST', url: '/api/v1/auth/register', class: 'sensitive' },
   { method: 'POST', url: '/api/v1/auth/refresh', class: 'sensitive' },
-  { method: 'POST', url: '/api/v1/wallet/nonce', class: 'sensitive' },
-  { method: 'POST', url: '/api/v1/wallet/verify', class: 'sensitive' },
+  { method: 'POST', url: '/api/v1/auth/password-reset', class: 'sensitive' },
+  { method: 'POST', url: '/api/v1/auth/password-reset/confirm', class: 'sensitive' },
+  { method: 'POST', url: '/api/v1/auth/wallet/challenge', class: 'walletNonce' },
+  { method: 'POST', url: '/api/v1/auth/wallet/verify', class: 'walletVerify' },
 
   // Money movement.
   { method: 'POST', url: '/api/v1/transactions/tip', class: 'sensitive' },
@@ -76,6 +90,7 @@ export const RATE_LIMIT_RULES: RateLimitRule[] = [
   { method: 'POST', url: '/api/v1/payments', class: 'sensitive' },
   { method: 'POST', url: '/api/v1/payments/:id/refund', class: 'sensitive' },
   { method: 'POST', url: '/api/v1/creators/payout', class: 'sensitive' },
+  { method: 'POST', url: '/api/v1/referrals/payout', class: 'sensitive' },
 
   // Resource intensive: Stellar Horizon round-trips, job enqueueing, cache
   // warming and EXPLAIN queries.

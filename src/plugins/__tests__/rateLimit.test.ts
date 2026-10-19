@@ -1,7 +1,14 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import Fastify, { FastifyInstance, FastifyServerOptions, RouteOptions } from 'fastify';
 import jwt from 'jsonwebtoken';
 import { classifyRoute, registerRateLimiting, RateLimitingOptions } from '../rateLimit';
+
+// These tests exercise rate-limit bucketing, not database-backed JWT revocation.
+vi.mock('../../utils/token-blacklist', () => ({
+  isTokenBlacklisted: vi.fn().mockResolvedValue(false),
+  isUserAuthVersionCurrent: vi.fn().mockResolvedValue(true),
+}));
+
 import { authMiddleware } from '../../middleware/auth';
 import { requireAdmin } from '../../middleware/rbac';
 import { globalErrorHandler } from '../../middleware/error-handler';
@@ -20,6 +27,8 @@ const POLICIES: Record<RateLimitClass, RateLimitPolicy> = {
   public: { max: 3, timeWindowMs: 60_000 },
   authenticated: { max: 5, timeWindowMs: 60_000 },
   sensitive: { max: 2, timeWindowMs: 60_000 },
+  walletNonce: { max: 2, timeWindowMs: 3_600_000 },
+  walletVerify: { max: 3, timeWindowMs: 3_600_000 },
 };
 
 const token = (userId: string) =>
@@ -310,6 +319,8 @@ describe('route classification', () => {
     expect(classify(route('HEAD', '/readiness'))).toBe('exempt');
     expect(classify(route('OPTIONS', '/*'))).toBe('exempt');
     expect(classify(route('POST', '/api/v1/auth/login'))).toBe('sensitive');
+    expect(classify(route('POST', '/api/v1/auth/password-reset'))).toBe('sensitive');
+    expect(classify(route('POST', '/api/v1/auth/password-reset/confirm'))).toBe('sensitive');
     expect(classify(route('POST', '/api/v1/transactions/tip', { preHandler: [authMiddleware] }))).toBe(
       'sensitive'
     );
@@ -348,5 +359,187 @@ describe('parseTrustProxy', () => {
     expect(parseTrustProxy('true')).toBe(true);
     expect(parseTrustProxy('1')).toBe(1);
     expect(parseTrustProxy('10.0.0.0/8, 127.0.0.1')).toEqual(['10.0.0.0/8', '127.0.0.1']);
+  });
+});
+
+// Small wallet-specific limits used in the block below so tests run fast.
+const WALLET_POLICIES: Record<RateLimitClass, RateLimitPolicy> = {
+  public: { max: 100, timeWindowMs: 60_000 },
+  authenticated: { max: 100, timeWindowMs: 60_000 },
+  sensitive: { max: 100, timeWindowMs: 60_000 },
+  walletNonce: { max: 2, timeWindowMs: 3_600_000 },
+  walletVerify: { max: 3, timeWindowMs: 3_600_000 },
+};
+
+async function buildWalletApp(): Promise<FastifyInstance> {
+  const instance = Fastify({ logger: false });
+  instance.setErrorHandler(globalErrorHandler);
+
+  await registerRateLimiting(instance, {
+    enabled: true,
+    store: 'memory',
+    policies: WALLET_POLICIES,
+    rules: [
+      { method: 'POST', url: '/api/v1/auth/wallet/challenge', class: 'walletNonce' },
+      { method: 'POST', url: '/api/v1/auth/wallet/verify', class: 'walletVerify' },
+    ],
+    exemptions: [],
+  });
+
+  const ok = async () => ({ ok: true });
+  instance.post('/api/v1/auth/wallet/challenge', { preHandler: authMiddleware }, ok);
+  instance.post('/api/v1/auth/wallet/verify', { preHandler: authMiddleware }, ok);
+
+  await instance.ready();
+  return instance;
+}
+
+describe('wallet route per-user rate limiting', () => {
+  afterEach(async () => {
+    await app?.close();
+  });
+
+  it('per-user isolation for nonce: exhausting one user does not block another', async () => {
+    app = await buildWalletApp();
+
+    // alice exhausts the 2-request nonce limit
+    const aliceResponses = await Promise.all([
+      app.inject({ method: 'POST', url: '/api/v1/auth/wallet/challenge', headers: bearer('alice-wallet') }),
+      app.inject({ method: 'POST', url: '/api/v1/auth/wallet/challenge', headers: bearer('alice-wallet') }),
+    ]);
+    expect(aliceResponses.map((r) => r.statusCode)).toEqual([200, 200]);
+
+    const aliceBlocked = await app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/wallet/challenge',
+      headers: bearer('alice-wallet'),
+    });
+    expect(aliceBlocked.statusCode).toBe(429);
+
+    // bob uses the same IP — different user bucket, not blocked
+    const bob = await app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/wallet/challenge',
+      headers: bearer('bob-wallet'),
+    });
+    expect(bob.statusCode).toBe(200);
+    expect(bob.headers['x-ratelimit-limit']).toBe('2');
+  });
+
+  it('per-user isolation for verify: exhausting one user does not block another', async () => {
+    app = await buildWalletApp();
+
+    for (let i = 0; i < 3; i++) {
+      await app.inject({ method: 'POST', url: '/api/v1/auth/wallet/verify', headers: bearer('alice-verify') });
+    }
+
+    const aliceBlocked = await app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/wallet/verify',
+      headers: bearer('alice-verify'),
+    });
+    expect(aliceBlocked.statusCode).toBe(429);
+
+    const bob = await app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/wallet/verify',
+      headers: bearer('bob-verify'),
+    });
+    expect(bob.statusCode).toBe(200);
+    expect(bob.headers['x-ratelimit-limit']).toBe('3');
+  });
+
+  it('rate-limit headers reflect wallet nonce policy (not sensitive or authenticated)', async () => {
+    app = await buildWalletApp();
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/wallet/challenge',
+      headers: bearer('carol-wallet'),
+    });
+    expect(res.statusCode).toBe(200);
+    // walletNonce limit is 2, not the sensitive (100) or authenticated (100) defaults
+    expect(res.headers['x-ratelimit-limit']).toBe('2');
+  });
+
+  it('window is 1 hour: x-ratelimit-reset reflects hourly window', async () => {
+    app = await buildWalletApp();
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/wallet/challenge',
+      headers: bearer('dave-wallet'),
+    });
+    expect(res.statusCode).toBe(200);
+    // @fastify/rate-limit returns reset in seconds; 1 hour = 3600 s
+    expect(Number(res.headers['x-ratelimit-reset'])).toBeLessThanOrEqual(3600);
+    expect(Number(res.headers['x-ratelimit-reset'])).toBeGreaterThan(0);
+  });
+
+  it('user follows across IPs: nonce quota exhausted on IP A also blocks on IP B', async () => {
+    app = await buildWalletApp();
+
+    // Exhaust from IP A
+    for (let i = 0; i < 2; i++) {
+      await app.inject({
+        method: 'POST',
+        url: '/api/v1/auth/wallet/challenge',
+        headers: bearer('eve-wallet'),
+        remoteAddress: '10.1.1.1',
+      });
+    }
+
+    // Same user from IP B — should be blocked (keyed by userId, not IP)
+    const fromIpB = await app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/wallet/challenge',
+      headers: bearer('eve-wallet'),
+      remoteAddress: '10.1.1.2',
+    });
+    expect(fromIpB.statusCode).toBe(429);
+  });
+
+  it('unauthenticated request falls back to IP bucket, not a user bucket', async () => {
+    app = await buildWalletApp();
+
+    // Unauthenticated requests to wallet routes still increment the rate-limit counter
+    // (onRequest fires before authMiddleware's preHandler). The response is 401 from
+    // authMiddleware, but the IP bucket still depletes. After exhausting the walletNonce
+    // limit of 2, the 3rd unauthenticated request from the same IP receives 429.
+    for (let i = 0; i < 2; i++) {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/v1/auth/wallet/challenge',
+        remoteAddress: '10.2.2.2',
+      });
+      // Auth rejected, but rate-limit counter was incremented
+      expect(res.statusCode).toBe(401);
+    }
+
+    // Third request from the same IP without a token — now blocked at the rate limit
+    const blocked = await app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/wallet/challenge',
+      remoteAddress: '10.2.2.2',
+    });
+    expect(blocked.statusCode).toBe(429);
+
+    // A different IP without a token has its own bucket — not yet exhausted
+    const otherIp = await app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/wallet/challenge',
+      remoteAddress: '10.2.2.3',
+    });
+    // This IP's bucket is fresh, so rate limit passes and authMiddleware rejects with 401
+    expect(otherIp.statusCode).toBe(401);
+
+    // An authenticated user from the same blocked IP uses a separate user bucket
+    const authedFromBlockedIp = await app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/wallet/challenge',
+      headers: bearer('frank-wallet'),
+      remoteAddress: '10.2.2.2',
+    });
+    expect(authedFromBlockedIp.statusCode).toBe(200);
   });
 });

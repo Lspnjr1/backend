@@ -1,7 +1,7 @@
 import { randomUUID } from 'crypto';
 import { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { PrismaClient } from '@prisma/client';
-import { UnauthorizedError } from '../../utils/errors';
+import { UnauthorizedError, ValidationError } from '../../utils/errors';
 import { formatSuccess } from '../../types/response';
 import { authMiddleware } from '../../middleware/auth';
 import { ChargeService } from './charge.service';
@@ -15,15 +15,28 @@ import {
   RefundPaymentSchema,
 } from './charge.types';
 import { PaymentProvider } from '../../lib/payments/provider';
+import { z } from 'zod';
 
 interface RawBodyRequest extends FastifyRequest {
   rawBody?: string;
 }
 
+const uuidSchema = z.string().uuid();
+
 function idempotencyKeyFrom(request: FastifyRequest, body?: { idempotencyKey?: string }): string {
+  // Body-supplied key has already been validated by Zod schema parsing before this function is called.
+  if (body?.idempotencyKey) {
+    return body.idempotencyKey;
+  }
   const header = request.headers['idempotency-key'];
   const headerValue = Array.isArray(header) ? header[0] : header;
-  return body?.idempotencyKey || headerValue || randomUUID();
+  if (headerValue !== undefined) {
+    if (!uuidSchema.safeParse(headerValue).success) {
+      throw new ValidationError('Idempotency-Key header must be a valid UUID v4', { header: headerValue });
+    }
+    return headerValue;
+  }
+  return randomUUID();
 }
 
 /**
@@ -108,7 +121,7 @@ export const registerChargeRoutes = (
               method: { type: 'string', enum: ['card', 'wallet', 'crypto'] },
               creatorId: { type: 'string' },
               description: { type: 'string', maxLength: 500 },
-              idempotencyKey: { type: 'string', minLength: 8, maxLength: 255 },
+              idempotencyKey: { type: 'string', format: 'uuid' },
             },
           },
           response: {
@@ -220,7 +233,7 @@ export const registerChargeRoutes = (
                 type: 'string',
                 enum: ['requested_by_customer', 'duplicate', 'fraudulent'],
               },
-              idempotencyKey: { type: 'string', minLength: 8, maxLength: 255 },
+              idempotencyKey: { type: 'string', format: 'uuid' },
             },
           },
           response: {

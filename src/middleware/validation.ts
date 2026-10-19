@@ -1,6 +1,7 @@
 import { FastifyReply, FastifyRequest } from 'fastify';
 import { LRUCache } from 'lru-cache';
 import { ZodError, ZodSchema } from 'zod';
+import { stripHtml } from '../utils/sanitization';
 import { AppError } from '../utils/errors';
 import { logger } from '../utils/logger';
 import {
@@ -33,7 +34,9 @@ export interface ValidationIssue {
 }
 
 export interface RequestValidationErrorDetails {
+  [key: string]: unknown;
   issues: ValidationIssue[];
+  fields: Record<string, string>;
 }
 
 /**
@@ -47,7 +50,10 @@ export class RequestValidationError extends AppError {
   constructor(issues: ValidationIssue[]) {
     super(400, 'VALIDATION_ERROR', 'The request data is invalid');
     this.name = 'RequestValidationError';
-    this.details = { issues };
+    this.details = {
+      issues,
+      fields: Object.fromEntries(issues.map((issue) => [issue.path, issue.message])),
+    };
   }
 }
 
@@ -61,8 +67,6 @@ export interface SanitizeOptions {
 // Control characters that have no place in user input (allows \t \n \r).
 // eslint-disable-next-line no-control-regex
 const CONTROL_CHARS = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g;
-const HTML_TAGS = /<\/?[a-z][^>]*>/gi;
-const DANGEROUS_SCHEMES = /(javascript|vbscript|data)\s*:/gi;
 
 /**
  * Sanitizes a single string: removes control characters, strips HTML tags and
@@ -70,12 +74,12 @@ const DANGEROUS_SCHEMES = /(javascript|vbscript|data)\s*:/gi;
  * allowlist-oriented normalization step applied *before* validation.
  */
 export function sanitizeString(input: string, options: SanitizeOptions = {}): string {
-  const { collapseWhitespace = false, stripHtml = true } = options;
+  const { collapseWhitespace = false, stripHtml: shouldStripHtml = true } = options;
 
   let value = input.replace(CONTROL_CHARS, '');
 
-  if (stripHtml) {
-    value = value.replace(HTML_TAGS, '').replace(DANGEROUS_SCHEMES, '');
+  if (shouldStripHtml) {
+    value = stripHtml(value);
   }
 
   if (collapseWhitespace) {

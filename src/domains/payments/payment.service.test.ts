@@ -1,6 +1,27 @@
+import type { PrismaClient } from '@prisma/client';
+vi.mock('../webhooks/webhook.service', () => ({
+  WebhookService: vi.fn(() => ({ dispatchEvent: publish })),
+}));
+const { publish } = vi.hoisted(() => ({ publish: vi.fn().mockResolvedValue(undefined) }));
+vi.mock('../../lib/queue', () => ({ stellarConfirmationQueue: { add: vi.fn() } }));
+// #175 — stub getWalletBalance so tests stay hermetic (no Stellar network call)
+vi.mock('../../lib/stellar/wallet', () => ({
+  getWalletBalance: vi.fn(),
+}));
+// The Stellar network is never reached from these tests: the transaction
+// helpers are stubbed so memo tests can assert whether a build was attempted.
+vi.mock('../../lib/stellar/transactions', () => ({
+  buildPaymentTransaction: vi.fn(),
+  submitSignedTransaction: vi.fn(),
+}));
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { PaymentService } from './payment.service';
-import { ValidationError, NotFoundError } from '../../utils/errors';
+import { ValidationError, NotFoundError, PaymentDeclinedError, PaymentNotFoundError } from '../../utils/errors';
+import { getWalletBalance } from '../../lib/stellar/wallet';
+import { buildPaymentTransaction as buildStellarTransaction } from '../../lib/stellar/transactions';
+import { MEMO_MAX_LENGTH, buildTipMemo } from '../../lib/stellar/validation';
+
+const mockGetWalletBalance = getWalletBalance as ReturnType<typeof vi.fn>;
 
 // Mock Prisma
 const mockPrisma = {
@@ -12,6 +33,9 @@ const mockPrisma = {
     findUnique: vi.fn(),
   },
   wallet: {
+    findFirst: vi.fn(),
+  },
+  stellarAsset: {
     findFirst: vi.fn(),
   },
   walletFlag: {
@@ -35,8 +59,20 @@ describe('PaymentService', () => {
   let paymentService: PaymentService;
 
   beforeEach(() => {
-    paymentService = new PaymentService(mockPrisma as any);
+    paymentService = new PaymentService(mockPrisma as unknown as PrismaClient);
     vi.clearAllMocks();
+
+    // #175 — default: wallet has ample balance so existing tests pass unchanged
+    mockGetWalletBalance.mockResolvedValue({ lumens: '100', usdc: '1000' });
+
+    mockPrisma.stellarAsset.findFirst.mockResolvedValue({
+      id: 'asset-usdc',
+      code: 'USDC',
+      issuer: 'GUSDCISSUER',
+      decimals: 7,
+      enabled: true,
+      priority: 100,
+    });
   });
 
   describe('createTip', () => {
@@ -81,6 +117,12 @@ describe('PaymentService', () => {
         message: 'Great content!',
       });
 
+      expect(publish).toHaveBeenCalledWith(
+        creatorId,
+        'tip-123',
+        'tip.created',
+        expect.objectContaining({ amount: 100 })
+      );
       expect(result.id).toBe('tip-123');
       expect(result.amount).toBe(100);
       expect(result.status).toBe('pending');
@@ -168,9 +210,9 @@ describe('PaymentService', () => {
       });
       mockPrisma.walletFlag.findFirst.mockResolvedValue({ id: 'flag-1' });
 
-      await expect(
-        paymentService.createTip(userId, { creatorId, amount: 50 })
-      ).rejects.toThrow(ValidationError);
+      await expect(paymentService.createTip(userId, { creatorId, amount: 50 })).rejects.toThrow(
+        PaymentDeclinedError
+      );
       expect(mockPrisma.tip.create).not.toHaveBeenCalled();
     });
 
@@ -227,9 +269,9 @@ describe('PaymentService', () => {
       mockPrisma.walletFlag.findFirst.mockResolvedValue(null);
       mockPrisma.accountFreeze.findFirst.mockResolvedValue({ id: 'freeze-1' });
 
-      await expect(
-        paymentService.createTip(userId, { creatorId, amount: 100 })
-      ).rejects.toThrow(ValidationError);
+      await expect(paymentService.createTip(userId, { creatorId, amount: 100 })).rejects.toThrow(
+        PaymentDeclinedError
+      );
       expect(mockPrisma.tip.create).not.toHaveBeenCalled();
     });
 
@@ -297,8 +339,34 @@ describe('PaymentService', () => {
           message: true,
           status: true,
           transactionHash: true,
+          assetCode: true,
+          assetIssuer: true,
+          assetDecimals: true,
+          moderationState: true,
           createdAt: true,
           updatedAt: true,
+          media: {
+            where: { status: 'ready' },
+            orderBy: { attachedAt: 'asc' },
+            select: {
+              id: true,
+              kind: true,
+              status: true,
+              mimeType: true,
+              fileName: true,
+              sizeBytes: true,
+              width: true,
+              height: true,
+              durationSeconds: true,
+              storageKey: true,
+              derivatives: true,
+              processingStatus: true,
+              processingError: true,
+              tipId: true,
+              attachedAt: true,
+              createdAt: true,
+            },
+          },
         },
       });
     });
@@ -306,7 +374,7 @@ describe('PaymentService', () => {
     it('should throw NotFoundError if tip does not exist', async () => {
       mockPrisma.tip.findUnique.mockResolvedValue(null);
 
-      await expect(paymentService.getTip('non-existent')).rejects.toThrow(NotFoundError);
+      await expect(paymentService.getTip('non-existent')).rejects.toThrow(PaymentNotFoundError);
     });
   });
 
@@ -352,7 +420,11 @@ describe('PaymentService', () => {
       expect(result.hasPrev).toBe(false);
       expect(mockPrisma.tip.findMany).toHaveBeenCalledWith(
         expect.objectContaining({
-          where: { creatorId, status: 'completed' },
+          where: {
+            creatorId,
+            status: 'completed',
+            moderationState: 'visible',
+          },
           skip: 0,
           take: 20,
         })
@@ -427,6 +499,67 @@ describe('PaymentService', () => {
 
       expect(result.items).toHaveLength(1);
       expect(result.pageInfo).toBeDefined();
+    });
+  });
+
+  describe('buildPaymentTransaction memo validation (#180)', () => {
+    const tipId = 'tip-123';
+    const senderPublicKey = 'GSENDER';
+    const creatorPublicKey = 'GCREATOR';
+
+    const build = (memo?: string) =>
+      paymentService.buildPaymentTransaction(
+        tipId,
+        senderPublicKey,
+        creatorPublicKey,
+        '10',
+        undefined,
+        undefined,
+        memo
+      );
+
+    beforeEach(() => {
+      mockPrisma.tip.findUnique.mockResolvedValue({
+        id: tipId,
+        fromUserId: 'user-123',
+        status: 'pending',
+      });
+      mockPrisma.wallet.findFirst.mockResolvedValue({ id: 'wallet-123', userId: 'user-123' });
+      vi.mocked(buildStellarTransaction).mockResolvedValue({ toXDR: () => 'AAAA-envelope' });
+    });
+
+    it('passes a 28 byte memo through to the Stellar builder', async () => {
+      const memo = 'a'.repeat(MEMO_MAX_LENGTH);
+
+      const result = await build(memo);
+
+      expect(result.transactionEnvelope).toBe('AAAA-envelope');
+      expect(buildStellarTransaction).toHaveBeenCalledWith(expect.objectContaining({ memo }));
+    });
+
+    it('derives the memo from the tip id when none is supplied', async () => {
+      await build();
+
+      expect(buildStellarTransaction).toHaveBeenCalledWith(
+        expect.objectContaining({ memo: buildTipMemo(tipId) })
+      );
+    });
+
+    it('rejects a 29 byte memo without attempting to build the transaction', async () => {
+      await expect(build('a'.repeat(MEMO_MAX_LENGTH + 1))).rejects.toThrow(ValidationError);
+
+      expect(buildStellarTransaction).not.toHaveBeenCalled();
+      expect(mockPrisma.tip.findUnique).not.toHaveBeenCalled();
+    });
+
+    it('rejects a multibyte memo that fits in characters but not in bytes', async () => {
+      // 15 two byte characters: 15 characters, 30 bytes.
+      const error = await build('é'.repeat(15)).catch((caught: unknown) => caught);
+
+      expect(error).toBeInstanceOf(ValidationError);
+      expect((error as ValidationError).message).toContain(`${MEMO_MAX_LENGTH} UTF-8 bytes`);
+      expect((error as ValidationError).details).toEqual({ field: 'memo' });
+      expect(buildStellarTransaction).not.toHaveBeenCalled();
     });
   });
 

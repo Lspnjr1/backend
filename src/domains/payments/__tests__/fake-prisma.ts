@@ -1,4 +1,3 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
 /**
  * Minimal in-memory stand-in for the Prisma client, covering only the models
  * the payment service touches. Lets tests exercise real idempotency, refund
@@ -12,6 +11,19 @@ export class FakePrisma {
   blacklistedToken = {
     findUnique: async () => null,
     create: async () => ({}),
+    findMany: async () => [],
+    deleteMany: async () => ({ count: 0 }),
+  };
+
+  /** Stub for auth-version checks in tests — always returns authVersion 0 for any userId. */
+  user = {
+    findUnique: async ({ where }: any) => {
+      const found = this.users.find((u) => u.id === where.id);
+      if (found) return found;
+      // Return a minimal user with authVersion 0 so token validation passes in tests
+      if (where.id) return { id: where.id, authVersion: 0 };
+      return null;
+    },
   };
 
   private sequence = 0;

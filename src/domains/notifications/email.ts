@@ -1,6 +1,10 @@
 import { emailNotificationQueue } from '../../lib/queue';
+import { config } from '../../config/env';
+import { isFeatureEnabled } from '../../config/features';
+import { logger } from '../../utils/logger';
+import { withJobTracePayload } from '../../lib/requestContext';
 
-export type EmailTemplate = 'verification' | 'password-reset' | 'notification';
+export type EmailTemplate = 'verification' | 'password-reset' | 'creator-verification' | 'account-locked' | 'account-deletion-scheduled' | 'notification';
 
 export interface EmailNotification {
   to: string;
@@ -11,19 +15,34 @@ export interface EmailNotification {
 }
 
 export async function enqueueEmail(notification: EmailNotification): Promise<string> {
-  const job = await emailNotificationQueue.add('send', notification, {
-    attempts: 5,
-    backoff: { type: 'exponential', delay: 1000 },
-    removeOnComplete: { age: 7 * 24 * 60 * 60, count: 10000 },
-    removeOnFail: { age: 30 * 24 * 60 * 60 },
-  });
+  // Feature flag gate (#60): verification mail is skipped entirely when the
+  // email-verification flag is disabled for the environment.
+  if (notification.template === 'verification' && !isFeatureEnabled('emailVerification')) {
+    logger.info({ to: notification.to }, 'Email verification disabled by feature flag, skipping send');
+    return '';
+  }
+
+  const job = await emailNotificationQueue.add(
+    'send',
+    withJobTracePayload(notification as unknown as Record<string, unknown>, {
+      userId: notification.userId,
+    }),
+    {
+      attempts: 5,
+      backoff: { type: 'exponential', delay: 1000 },
+      removeOnComplete: { age: 7 * 24 * 60 * 60, count: 10000 },
+      removeOnFail: { age: 30 * 24 * 60 * 60 },
+    }
+  );
   return String(job.id);
 }
 
 export async function enqueueEmailBatch(notifications: EmailNotification[]): Promise<string[]> {
   const jobs = await emailNotificationQueue.addBulk(notifications.map((notification) => ({
     name: 'send',
-    data: notification,
+    data: withJobTracePayload(notification as unknown as Record<string, unknown>, {
+      userId: notification.userId,
+    }),
     opts: {
       attempts: 5,
       backoff: { type: 'exponential' as const, delay: 1000 },
@@ -47,5 +66,37 @@ export function renderEmail(template: EmailTemplate, data: Record<string, string
   if (template === 'password-reset') {
     return { subject: 'Reset your Dorisio password', html: `<p>Hello ${name},</p><p><a href="${link}">Reset your password</a></p>` };
   }
+  if (template === 'creator-verification') {
+    const status = escape(data.status ?? 'updated');
+    const reason = data.reason ? `<p>Review note: ${escape(data.reason)}</p>` : '';
+    return { subject: `Creator verification ${status}`, html: `<p>Hello ${name},</p><p>Your creator verification request was ${status}.</p>${reason}` };
+  }
+  if (template === 'account-locked') {
+    return { subject: 'Your Dorisio account was temporarily locked', html: `<p>Hello ${name},</p><p>We detected repeated failed login attempts. Your account is temporarily locked until ${escape(data.unlockAt ?? 'later')}.</p>` };
+  }
+  if (template === 'account-deletion-scheduled') {
+    const scheduledFor = escape(data.scheduledFor ?? 'in 30 days');
+    return { subject: 'Your Dorisio account deletion is scheduled', html: `<p>Hello ${name},</p><p>We received a request to delete your account. Your account and data are scheduled to be permanently deleted on ${scheduledFor}.</p><p>If you did not request this, or changed your mind, you can cancel the deletion before then: <a href="${link}">Cancel account deletion</a></p>` };
+  }
   return { subject: escape(data.subject ?? 'Dorisio notification'), html: `<p>Hello ${name},</p><p>${escape(data.message ?? '')}</p>` };
+}
+
+/**
+ * Sends (enqueues) a templated email. Thin wrapper used by services
+ * (`AuthService`); actual delivery happens on the email notification worker.
+ * Never throws: delivery failures are logged and reported as `false` so
+ * callers can degrade gracefully.
+ */
+export async function sendEmail(notification: EmailNotification): Promise<boolean> {
+  if (!config.SENDGRID_API_KEY) {
+    logger.warn({ to: notification.to, template: notification.template }, 'SENDGRID_API_KEY not configured; email skipped');
+    return false;
+  }
+  try {
+    await enqueueEmail(notification);
+    return true;
+  } catch (err) {
+    logger.error({ err, to: notification.to }, 'Failed to enqueue email');
+    return false;
+  }
 }

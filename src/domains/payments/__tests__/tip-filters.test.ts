@@ -16,7 +16,10 @@ describe('buildTipWhere', () => {
   });
 
   it('builds an inclusive date range', () => {
-    const where: any = buildTipWhere({}, { minDate: '2026-01-01T00:00:00.000Z', maxDate: '2026-02-01T00:00:00.000Z' });
+    const where: any = buildTipWhere(
+      {},
+      { minDate: '2026-01-01T00:00:00.000Z', maxDate: '2026-02-01T00:00:00.000Z' }
+    );
     expect(where.createdAt.gte).toEqual(new Date('2026-01-01T00:00:00.000Z'));
     expect(where.createdAt.lte).toEqual(new Date('2026-02-01T00:00:00.000Z'));
   });
@@ -28,6 +31,32 @@ describe('buildTipWhere', () => {
     expect((buildTipWhere({}, { maxDate: '2026-01-01T00:00:00.000Z' }) as any).createdAt).toEqual({
       lte: new Date('2026-01-01T00:00:00.000Z'),
     });
+  });
+
+  it('resolves a bare, offset-less date against the given timezone (issue #216)', () => {
+    const where: any = buildTipWhere(
+      {},
+      {
+        minDate: '2026-01-15T00:00:00',
+        maxDate: '2026-01-15T23:59:59',
+        timezone: 'America/New_York',
+      }
+    );
+    expect(where.createdAt.gte).toEqual(new Date('2026-01-15T05:00:00.000Z'));
+    expect(where.createdAt.lte).toEqual(new Date('2026-01-16T04:59:59.000Z'));
+  });
+
+  it('ignores the timezone when minDate/maxDate already carry an explicit offset', () => {
+    const where: any = buildTipWhere(
+      {},
+      { minDate: '2026-01-15T00:00:00Z', timezone: 'America/New_York' }
+    );
+    expect(where.createdAt.gte).toEqual(new Date('2026-01-15T00:00:00.000Z'));
+  });
+
+  it('defaults a bare date to UTC when no timezone is given', () => {
+    const where: any = buildTipWhere({}, { minDate: '2026-01-15T00:00:00' });
+    expect(where.createdAt.gte).toEqual(new Date('2026-01-15T00:00:00.000Z'));
   });
 
   it('builds an inclusive amount range, including a zero lower bound', () => {
@@ -96,15 +125,19 @@ describe('TipHistoryQuerySchema', () => {
     expect(TipHistoryQuerySchema.safeParse({}).success).toBe(true);
   });
 
-  it('normalizes dates to ISO-8601 and coerces numeric strings', () => {
+  it('accepts bare dates without eagerly normalizing them, and coerces numeric strings', () => {
+    // minDate/maxDate are deliberately kept as given, not normalized to a
+    // UTC ISO string here (issue #216): resolveToUtc (buildTipWhere) is the
+    // one place that decides what a bare, offset-less value means, once
+    // `timezone` is also available. See the "timezone" describe block below.
     const parsed = TipHistoryQuerySchema.parse({
       minDate: '2026-01-01',
       maxDate: '2026-02-01',
       minAmount: '25',
       status: 'completed',
     });
-    expect(parsed.minDate).toBe('2026-01-01T00:00:00.000Z');
-    expect(parsed.maxDate).toBe('2026-02-01T00:00:00.000Z');
+    expect(parsed.minDate).toBe('2026-01-01');
+    expect(parsed.maxDate).toBe('2026-02-01');
     expect(parsed.minAmount).toBe(25);
     expect(parsed.status).toBe('completed');
   });
@@ -118,9 +151,7 @@ describe('TipHistoryQuerySchema', () => {
   });
 
   it('rejects an inverted amount range and a negative amount', () => {
-    expect(
-      TipHistoryQuerySchema.safeParse({ minAmount: 500, maxAmount: 100 }).success
-    ).toBe(false);
+    expect(TipHistoryQuerySchema.safeParse({ minAmount: 500, maxAmount: 100 }).success).toBe(false);
     expect(TipHistoryQuerySchema.safeParse({ minAmount: -1 }).success).toBe(false);
   });
 
@@ -129,6 +160,19 @@ describe('TipHistoryQuerySchema', () => {
     expect(
       TipHistoryQuerySchema.safeParse({ query: 'x'.repeat(TIP_TEXT_SEARCH_MAX_LENGTH + 1) }).success
     ).toBe(false);
+  });
+
+  it('accepts a valid IANA timezone (issue #216)', () => {
+    const parsed = TipHistoryQuerySchema.parse({ timezone: 'America/New_York' });
+    expect(parsed.timezone).toBe('America/New_York');
+  });
+
+  it('rejects a timezone that is not a valid IANA identifier', () => {
+    expect(TipHistoryQuerySchema.safeParse({ timezone: 'Not/AZone' }).success).toBe(false);
+  });
+
+  it('rejects an empty timezone', () => {
+    expect(TipHistoryQuerySchema.safeParse({ timezone: '' }).success).toBe(false);
   });
 });
 
@@ -186,7 +230,12 @@ describe('PaymentService filtered listings', () => {
     // count() must see the same filter, otherwise the page metadata lies.
     expect(prisma.tip.count.mock.calls[0][0].where).toEqual(where);
 
-    expect(result.filters).toMatchObject({ status: 'completed', minAmount: 50, maxAmount: 500, query: 'thanks' });
+    expect(result.filters).toMatchObject({
+      status: 'completed',
+      minAmount: 50,
+      maxAmount: 500,
+      query: 'thanks',
+    });
   });
 
   it('scopes the user history to the caller and applies the amount band', async () => {
@@ -208,7 +257,10 @@ describe('PaymentService filtered listings', () => {
   });
 
   it('searches across creators without adding an implicit scope', async () => {
-    const result = await paymentService.searchTips(1, 20, { status: 'failed', minDate: '2026-01-01T00:00:00.000Z' });
+    const result = await paymentService.searchTips(1, 20, {
+      status: 'failed',
+      minDate: '2026-01-01T00:00:00.000Z',
+    });
 
     const where: any = prisma.tip.findMany.mock.calls[0][0].where;
     expect(where.creatorId).toBeUndefined();
@@ -216,5 +268,31 @@ describe('PaymentService filtered listings', () => {
     expect(where.status).toBe('failed');
     expect(result.total).toBe(5);
     expect(result.filters).toMatchObject({ status: 'failed' });
+  });
+
+  it('formats response timestamps in the requested timezone (issue #216)', async () => {
+    const result = await paymentService.listTips('creator_1', 1, 20, {
+      timezone: 'America/New_York',
+    });
+
+    for (const tip of result.tips) {
+      expect(tip.createdAt).toMatch(/[+-]\d{2}:\d{2}$/);
+      expect(tip.createdAt).not.toMatch(/Z$/);
+    }
+  });
+
+  it('formats response timestamps as plain UTC when no timezone is requested', async () => {
+    const result = await paymentService.listTips('creator_1', 1, 20, {});
+
+    for (const tip of result.tips) {
+      expect(tip.createdAt).toMatch(/Z$/);
+    }
+  });
+
+  it('echoes the requested timezone back in the filters metadata', async () => {
+    const result = await paymentService.listTips('creator_1', 1, 20, {
+      timezone: 'America/New_York',
+    });
+    expect(result.filters).toMatchObject({ timezone: 'America/New_York' });
   });
 });

@@ -3,7 +3,6 @@ import cache, {
   CacheType,
   TTL_CONFIG,
   getStats,
-  getHitRate,
   resetStats,
   increment,
   zAdd,
@@ -95,13 +94,13 @@ describe('Cache Layer', () => {
 
     it('should handle fetch errors gracefully', async () => {
       const fetchFn = vi.fn().mockRejectedValue(new Error('DB Error'));
-      
+
       const result = await getOrFetch({
         key: 'test:123',
         type: CacheType.USER,
         fetchFn,
       });
-      
+
       expect(result).toBeUndefined();
     });
   });
@@ -163,8 +162,26 @@ describe('Cache Layer', () => {
       vi.mocked(withRedis).mockImplementation(async (fn: any) => {
         return await fn({ set: vi.fn().mockResolvedValue('OK') });
       });
-      
+
       await expect(cache.set('test:jitter', { data: 'test' }, baseTtl)).resolves.not.toThrow();
+    });
+
+    it('jittered TTL passed to Redis PX is always a whole number (issue #217)', async () => {
+      // A float here (the un-rounded jitter formula's actual output nearly
+      // every time) makes a real `redis` v4 client reject the SET with
+      // "ERR value is not an integer or out of range", silently falling
+      // every single cache write back to memory-only. The mock above
+      // can't catch that since it accepts any value; this asserts on the
+      // literal argument instead.
+      const setMock = vi.fn().mockResolvedValue('OK');
+      vi.mocked(withRedis).mockImplementation(async (fn: any) => fn({ set: setMock }));
+
+      for (const baseTtl of [1_000, 60_000, 300_000, 3_600_000]) {
+        setMock.mockClear();
+        await cache.set(`test:jitter:${baseTtl}`, { data: 'test' }, baseTtl);
+        const [, , options] = setMock.mock.calls[0];
+        expect(Number.isInteger(options.PX)).toBe(true);
+      }
     });
   });
 
@@ -189,9 +206,7 @@ describe('Cache Layer', () => {
     });
 
     it('should handle concurrent reads', async () => {
-      const operations = Array.from({ length: 100 }, (_, i) =>
-        cache.get(`test:concurrent:${i}`)
-      );
+      const operations = Array.from({ length: 100 }, (_, i) => cache.get(`test:concurrent:${i}`));
 
       await expect(Promise.all(operations)).resolves.not.toThrow();
     });

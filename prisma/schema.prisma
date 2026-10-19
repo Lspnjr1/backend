@@ -8,23 +8,75 @@ datasource db {
 }
 
 model User {
-  id        String   @id @default(cuid())
-  email     String   @unique
-  password  String
-  name      String?
-  bio       String?
-  avatar    String?
-  role      String   @default("fan")
-  verified  Boolean  @default(false)
-  notificationPreferences Json @default("{}")
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  id                      String    @id @default(cuid())
+  email                   String    @unique
+  password                String
+  name                    String?
+  bio                     String?
+  phoneNumber             String?
+  avatar                  String?
+  role                    String    @default("fan")
+  verified                Boolean   @default(false)
+  authVersion             Int       @default(0)
+  failedLoginAttempts     Int       @default(0)
+  lockedUntil             DateTime?
+  notificationPreferences Json      @default("{}")
+  createdAt               DateTime  @default(now())
+  updatedAt               DateTime  @updatedAt
 
-  creator   Creator?
-  wallets   Wallet[]
-  tips      Tip[]
-  payments  Payment[]
-  userRoles UserRole[]
+  creator             Creator?
+  wallets             Wallet[]
+  tips                Tip[]
+  payments            Payment[]
+  twoFactor           TwoFactorAuth?
+  trustedDevices      TrustedDevice[]
+  twoFactorEvents     TwoFactorEvent[]
+  userRoles           UserRole[]
+  sessions            Session[]
+  passwordResetTokens PasswordResetToken[]
+  referralCode        ReferralCode?
+  referrals           Referral[]            @relation("RefereeUser")
+  referralCommissions ReferralCommission[]  @relation("ReferrerUser")
+  scheduledDeletions  ScheduledAccountDeletion[]
+}
+
+model TwoFactorAuth {
+  id          String   @id @default(cuid())
+  userId      String   @unique
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  secret      String
+  backupCodes String[]
+  // Set once the user has confirmed, by submitting one backup code back,
+  // that they actually saved the set issued at setup (issue #214).
+  // `enable()` refuses to turn 2FA on until this is true.
+  backupCodesConfirmed Boolean  @default(false)
+  enabled              Boolean  @default(false)
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+}
+
+model TrustedDevice {
+  id         String   @id @default(cuid())
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash  String   @unique
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+  lastUsedAt DateTime @default(now())
+
+  @@index([userId, expiresAt])
+}
+
+model TwoFactorEvent {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type      String
+  success   Boolean
+  ip        String?
+  createdAt DateTime @default(now())
+
+  @@index([userId, createdAt])
 }
 
 model Role {
@@ -55,6 +107,7 @@ model RolePermission {
   role         Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
   permission   Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
   createdAt    DateTime   @default(now())
+
   @@id([roleId, permissionId])
 }
 
@@ -65,6 +118,7 @@ model UserRole {
   role       Role     @relation(fields: [roleId], references: [id], onDelete: Cascade)
   assignedAt DateTime @default(now())
   assignedBy String?
+
   @@id([userId, roleId])
   @@index([roleId])
 }
@@ -78,6 +132,7 @@ model RoleChange {
   action    String
   details   Json?
   createdAt DateTime @default(now())
+
   @@index([actorId, createdAt])
   @@index([targetId, createdAt])
 }
@@ -92,22 +147,29 @@ model Creator {
   bio         String?
   avatar      String?
 
-  verified Boolean @default(false)
-  isPublic Boolean @default(true)
+  verified      Boolean   @default(false)
+  verifiedAt    DateTime?
+  verifiedUntil DateTime?
+  isPublic      Boolean   @default(true)
 
-  totalEarnings  Float @default(0)
-  pendingBalance Float @default(0)
-  
-  tips            Tip[]               @relation("CreatorTips")
-  webhooks        Webhook[]
-  freezes         AccountFreeze[]
-  payments        Payment[]
-  payouts         Payout[]
+  totalEarnings        Float                        @default(0)
+  pendingBalance       Float                        @default(0)
+  tips                 Tip[]                        @relation("CreatorTips")
+  webhooks             Webhook[]
+  freezes              AccountFreeze[]
+  payments             Payment[]
+  payouts              Payout[]
+  scheduledPayments    ScheduledPayment[]
+  verificationRequests CreatorVerificationRequest[]
+  verificationEvents   CreatorVerificationEvent[]
+
   // Teams this creator belongs to (#66).
   teamMemberships CreatorTeamMember[] @relation("CreatorTeamMembers")
-  
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+
+  defaultAssetId String?
+  defaultAsset   StellarAsset? @relation("CreatorDefaultAsset", fields: [defaultAssetId], references: [id], onDelete: SetNull)
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
 
   @@index([verified, isPublic])
   // Creator discovery feeds: visibility filter + deterministic keyset order.
@@ -116,6 +178,56 @@ model Creator {
   @@index([isPublic, verified, totalEarnings(sort: Desc)], map: "idx_creator_public_verified_earnings")
   // Global top-earners ranking (no filters).
   @@index([totalEarnings(sort: Desc)], map: "idx_creator_totalEarnings")
+  @@unique([username], map: "uniq_creator_username")
+}
+
+model CreatorVerificationRequest {
+  id           String                        @id @default(cuid())
+  creatorId    String
+  creator      Creator                       @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+  status       String                        @default("submitted") // submitted | approved | rejected | expired
+  statement    String?
+  reviewerId   String?
+  reviewedAt   DateTime?
+  reviewReason String?
+  expiresAt    DateTime
+  createdAt    DateTime                      @default(now())
+  updatedAt    DateTime                      @updatedAt
+  documents    CreatorVerificationDocument[]
+  events       CreatorVerificationEvent[]
+
+  @@index([status, createdAt])
+  @@index([creatorId, createdAt])
+  @@index([expiresAt])
+}
+
+model CreatorVerificationDocument {
+  id          String                     @id @default(cuid())
+  requestId   String
+  request     CreatorVerificationRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  storageKey  String                     @unique
+  filename    String
+  contentType String
+  size        Int
+  createdAt   DateTime                   @default(now())
+
+  @@index([requestId])
+}
+
+model CreatorVerificationEvent {
+  id        String                      @id @default(cuid())
+  creatorId String
+  creator   Creator                     @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+  requestId String?
+  request   CreatorVerificationRequest? @relation(fields: [requestId], references: [id], onDelete: SetNull)
+  actorId   String?
+  action    String // submitted | approved | rejected | expired | revoked
+  reason    String?
+  metadata  Json?
+  createdAt DateTime                    @default(now())
+
+  @@index([creatorId, createdAt])
+  @@index([requestId, createdAt])
 }
 
 model Wallet {
@@ -141,8 +253,13 @@ model Tip {
   creatorId String
   creator   Creator @relation("CreatorTips", fields: [creatorId], references: [id], onDelete: Cascade)
 
-  amount  Float
-  message String?
+  amount        Float
+  assetId       String?
+  asset         StellarAsset? @relation(fields: [assetId], references: [id], onDelete: SetNull)
+  assetCode     String        @default("USDC")
+  assetIssuer   String?
+  assetDecimals Int           @default(7)
+  message       String?
 
   status          String  @default("pending")
   transactionHash String? @unique
@@ -153,12 +270,21 @@ model Tip {
   // returns the original tip instead of creating a duplicate charge.
   idempotencyKey  String? @unique
 
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  // Tip message media (#64): images and short videos uploaded before the tip.
+  media           TipMedia[]
+  // Moderation state (#62): read paths only serve 'visible' rows, an open report
+  // can hide content while it is reviewed, and a resolved decision can remove it.
+  moderationState String     @default("visible") // visible, hidden, removed
+  createdAt       DateTime   @default(now())
+  updatedAt       DateTime   @updatedAt
+
+  referralCommission ReferralCommission?
 
   @@index([creatorId, status, createdAt])
   @@index([fromUserId, createdAt])
   @@index([status])
+  // Public tip reads filter on the moderation state.
+  @@index([moderationState], map: "idx_tip_moderationState")
   // Unfiltered creator tip history ordered newest-first (keyset friendly).
   @@index([creatorId, createdAt(sort: Desc), id(sort: Desc)], map: "idx_tip_creator_createdAt")
   // User tip history filtered by status.
@@ -175,6 +301,56 @@ model Tip {
   @@index([amount], map: "idx_tip_amount")
   @@index([status, amount], map: "idx_tip_status_amount")
   @@index([fromUserId, amount], map: "idx_tip_fromUser_amount")
+  @@index([assetId, createdAt], map: "idx_tip_asset_createdAt")
+}
+
+model StellarAsset {
+  id        String   @id @default(cuid())
+  code      String
+  issuer    String?
+  name      String
+  decimals  Int      @default(7)
+  enabled   Boolean  @default(true)
+  priority  Int      @default(0)
+  feeBps    Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tips            Tip[]
+  defaultCreators Creator[] @relation("CreatorDefaultAsset")
+
+  @@unique([code, issuer], map: "uniq_stellarAsset_code_issuer")
+  @@index([enabled, priority], map: "idx_stellarAsset_enabled_priority")
+}
+
+model Session {
+  id           String    @id @default(cuid())
+  userId       String
+  user         User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  token        String    @unique
+  device       String?
+  userAgent    String?
+  ipAddress    String?
+  lastActivity DateTime  @default(now())
+  expiresAt    DateTime
+  revokedAt    DateTime?
+  createdAt    DateTime  @default(now())
+
+  @@index([userId, revokedAt, expiresAt])
+  @@index([lastActivity])
+}
+
+model AuthAttempt {
+  id        String   @id @default(cuid())
+  email     String?
+  ipAddress String
+  action    String
+  success   Boolean  @default(false)
+  reason    String?
+  createdAt DateTime @default(now())
+
+  @@index([ipAddress, action, createdAt])
+  @@index([email, action, createdAt])
 }
 
 model BlacklistedToken {
@@ -212,26 +388,60 @@ model VerificationToken {
   @@index([userId])
 }
 
+model PasswordResetToken {
+  id        String   @id @default(cuid())
+  email     String
+  // SHA-256 digest of the one-time secret; the raw token is only emailed.
+  token     String   @unique
+  userId    String?
+  user      User?    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime
+  used      Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@index([email, createdAt])
+  @@index([expiresAt])
+  @@index([userId])
+}
+
 model Webhook {
   id        String  @id @default(cuid())
   creatorId String
   creator   Creator @relation(fields: [creatorId], references: [id], onDelete: Cascade)
 
-  url    String
-  events String[] // tip.created, tip.confirmed, tip.failed, payout.completed
-  secret String // HMAC secret for signature verification
-  active Boolean  @default(true)
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  url             String
+  events          String[] // Versioned event subscriptions, e.g. tip.created
+  secret          String // HMAC secret for signature verification
+  previousSecret  String? // Previous secret during rotation period
+  secretRotatedAt DateTime? // When secret was last rotated
+  active          Boolean   @default(true)
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
 
   webhookEvents WebhookEvent[]
+  webhookNonces WebhookNonce[]
 
   @@index([creatorId])
   // Webhook listing per creator, newest first.
   @@index([creatorId, createdAt(sort: Desc)], map: "idx_webhook_creator_createdAt")
   // Delivery worker only fans out to active endpoints.
   @@index([creatorId, active, createdAt(sort: Desc)], map: "idx_webhook_creator_active_createdAt")
+}
+
+model WebhookNonce {
+  id        String  @id @default(cuid())
+  webhookId String
+  webhook   Webhook @relation(fields: [webhookId], references: [id], onDelete: Cascade)
+
+  nonce     String   @unique // The nonce value from webhook request
+  timestamp BigInt // Unix timestamp of the webhook request
+  expiresAt DateTime // When this nonce can be cleaned up
+
+  createdAt DateTime @default(now())
+
+  @@index([webhookId, timestamp])
+  @@index([expiresAt]) // For cleanup of expired nonces
+  @@index([nonce]) // Fast lookup for replay detection
 }
 
 model WebhookEvent {
@@ -247,7 +457,7 @@ model WebhookEvent {
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
-  
+
   @@index([webhookId, status, createdAt(sort: Desc)])
   @@index([webhookId])
   @@index([status])
@@ -262,8 +472,8 @@ model WebhookEvent {
 // A payment processed by an external provider (Stripe et al). Raw card data is
 // never stored — only provider references and tokenized intent ids.
 model Payment {
-  id             String   @id @default(cuid())
-  idempotencyKey String   @unique
+  id             String @id @default(cuid())
+  idempotencyKey String @unique
 
   userId String
   user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
@@ -299,9 +509,9 @@ model PaymentEvent {
   paymentId String
   payment   Payment @relation(fields: [paymentId], references: [id], onDelete: Cascade)
 
-  type   String // payment.created, payment.succeeded, payment.failed, refund.created, chargeback.created, webhook.received
-  actor  String? // user id, "system" or "provider"
-  data   Json?
+  type  String // payment.created, payment.succeeded, payment.failed, refund.created, chargeback.created, webhook.received
+  actor String? // user id, "system" or "provider"
+  data  Json?
 
   // Provider event id — unique so webhook redelivery is idempotent.
   providerEventId String? @unique
@@ -337,11 +547,11 @@ model Refund {
   payment        Payment @relation(fields: [paymentId], references: [id], onDelete: Cascade)
   idempotencyKey String  @unique
 
-  amount       Float
-  currency     String  @default("USD")
-  reason       String?
-  status       String  @default("pending") // pending, succeeded, failed
-  providerRef  String?
+  amount      Float
+  currency    String  @default("USD")
+  reason      String?
+  status      String  @default("pending") // pending, succeeded, failed
+  providerRef String?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -364,7 +574,7 @@ model WalletFlag {
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
-  
+
   @@index([resolved, address])
   @@index([resolved, createdAt(sort: Desc)])
   @@index([resolved])
@@ -407,10 +617,129 @@ enum PayoutStatus {
   failed
 }
 
+// ─── Referral Program ────────────────────────────────────────────────────────
+
+// Commission tier configuration (admin-controlled).
+// Admins can define named tiers with different commission rates.
+// Each user is assigned a tier; default tier is applied if none specified.
+model ReferralTier {
+  id          String @id @default(cuid())
+  name        String @unique  // e.g. "standard", "silver", "gold"
+  description String?
+  // Commission as a fraction (e.g. 0.05 = 5%)
+  commissionRate Float
+  isDefault   Boolean @default(false)
+
+  referralCodes ReferralCode[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([isDefault])
+}
+
+// A unique referral code owned by a user. Each user may have at most one
+// active code at a time. The code is a short, URL-safe alphanumeric string.
+model ReferralCode {
+  id     String @id @default(cuid())
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  code      String  @unique
+  tierId    String?
+  tier      ReferralTier? @relation(fields: [tierId], references: [id], onDelete: SetNull)
+
+  isActive  Boolean @default(true)
+  // Soft fraud-lock: admin or system can deactivate without deleting history
+  lockedAt  DateTime?
+  lockReason String?
+
+  usageCount Int @default(0)
+
+  referrals    Referral[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId, isActive])
+  @@index([code])
+  // Dashboard: referrer looks up their own code list newest-first.
+  @@index([userId, createdAt(sort: Desc)], map: "idx_referralCode_user_createdAt")
+}
+
+// A single referral event: a new user who signed up via a referral code.
+// One referee -> one referral record.
+model Referral {
+  id             String       @id @default(cuid())
+  referralCodeId String
+  referralCode   ReferralCode @relation(fields: [referralCodeId], references: [id], onDelete: Cascade)
+
+  // The user who was referred (referee)
+  refereeId String
+  referee   User   @relation("RefereeUser", fields: [refereeId], references: [id], onDelete: Cascade)
+
+  // Depth starts at 1 for a direct referral. Used to enforce max-depth guard.
+  depth     Int @default(1)
+
+  // Lifecycle: pending → converted → rewarded | fraud
+  status    String @default("pending")  // pending, converted, rewarded, fraud
+
+  // When the referee completed the qualifying action (e.g. first confirmed tip)
+  convertedAt DateTime?
+
+  commissions ReferralCommission[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Prevent duplicate referral for the same referee
+  @@unique([refereeId])
+  @@index([referralCodeId, status])
+  @@index([refereeId])
+  @@index([status, createdAt])
+  // Referrer dashboard: all referrals for a given code, newest first.
+  @@index([referralCodeId, createdAt(sort: Desc)], map: "idx_referral_code_createdAt")
+}
+
+// A commission earned by a referrer when their referee's tip is confirmed.
+// Multiple commissions may exist per referral (one per qualifying tip).
+model ReferralCommission {
+  id         String   @id @default(cuid())
+  referralId String
+  referral   Referral @relation(fields: [referralId], references: [id], onDelete: Cascade)
+
+  // The tip that triggered this commission
+  tipId  String
+  tip    Tip    @relation(fields: [tipId], references: [id], onDelete: Cascade)
+
+  // Referrer (denormalized for query efficiency)
+  referrerId String
+  referrer   User   @relation("ReferrerUser", fields: [referrerId], references: [id], onDelete: Cascade)
+
+  amount         Float   // Commission amount (computed from tip.amount * commissionRate)
+  commissionRate Float   // Snapshot of the rate at the time of calculation
+  currency       String  @default("XLM")
+
+  // pending → paid | failed
+  status     String @default("pending")
+  paidAt     DateTime?
+  failReason String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([tipId])  // One commission per tip (idempotent)
+  @@index([referrerId, status])
+  @@index([referralId, status])
+  @@index([status, createdAt])
+  // Affiliate payout sweep: pending commissions for a referrer, oldest first.
+  @@index([referrerId, status, createdAt], map: "idx_referralCommission_referrer_status_createdAt")
+}
+
 model Payout {
-  id         String       @id @default(cuid())
-  creatorId  String
-  creator    Creator      @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+  id        String  @id @default(cuid())
+  creatorId String
+  creator   Creator @relation(fields: [creatorId], references: [id], onDelete: Cascade)
 
   amount          Float
   status          PayoutStatus @default(pending)
@@ -418,8 +747,8 @@ model Payout {
   walletAddress   String
 
   errorMessage String?
-  retryCount    Int      @default(0)
-  nextRetryAt   DateTime?
+  retryCount   Int       @default(0)
+  nextRetryAt  DateTime?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -432,6 +761,66 @@ model Payout {
   // Retry worker: failed payouts ordered by next retry time.
   @@index([status, nextRetryAt], map: "idx_payout_status_nextRetryAt")
   @@index([transactionHash])
+}
+
+// Media attached to tip messages (#64). The row exists before the bytes do (it is
+// the upload reservation), becomes `ready` once the file has been verified and
+// scanned, and is attached to a tip by setting `tipId` at tip creation time.
+model TipMedia {
+  id     String @id @default(cuid())
+  userId String
+
+  // Set when the media is attached to a tip; only `ready` media can be attached.
+  tipId String?
+  tip   Tip?    @relation(fields: [tipId], references: [id], onDelete: Cascade)
+
+  kind   String // image, video
+  status String @default("pending") // pending, uploaded, scanning, ready, rejected, failed
+
+  mimeType   String
+  fileName   String
+  storageKey String @unique
+  sizeBytes  Int    @default(0)
+
+  width           Int?
+  height          Int?
+  durationSeconds Float?
+  // Derived renditions (preview/optimized/thumbnail) with their keys and sizes.
+  derivatives     Json   @default("[]")
+
+  processingStatus String  @default("pending") // pending, done, skipped, failed
+  processingError  String?
+
+  scanner         String?
+  scanSignature   String?
+  scanCompletedAt DateTime?
+
+  uploadedAt DateTime?
+  attachedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // A user's own uploads, newest first, filtered by status.
+  @@index([userId, status, createdAt(sort: Desc)], map: "idx_tipMedia_user_status_createdAt")
+  // Media for a tip, in attachment order.
+  @@index([tipId, attachedAt], map: "idx_tipMedia_tip_attachedAt")
+  // Sweep for uploads that were reserved but never completed.
+  @@index([status, createdAt], map: "idx_tipMedia_status_createdAt")
+}
+
+// Per-user storage quota (#64). `usedBytes` counts verified media; uploads that
+// are still in flight are counted separately as reserved.
+model MediaQuota {
+  id     String @id @default(cuid())
+  userId String @unique
+
+  usedBytes  Int @default(0)
+  fileCount  Int @default(0)
+  limitBytes Int
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 }
 
 // ---------------------------------------------------------------------------
@@ -572,8 +961,8 @@ model TeamContribution {
 
   type        String // development | design | content | marketing | community | operations | manual
   description String?
-  amount      Float  @default(0)
-  weight      Int    @default(1)
+  amount      Float   @default(0)
+  weight      Int     @default(1)
   reference   String?
 
   occurredAt   DateTime @default(now())
@@ -647,8 +1036,8 @@ model TeamPayout {
   requestedBy   CreatorTeamMember? @relation(fields: [requestedById], references: [id], onDelete: SetNull)
 
   processedAt DateTime?
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
 
   @@index([teamId, status], map: "idx_teamPayout_team_status")
   @@index([teamId, createdAt(sort: Desc)], map: "idx_teamPayout_team_createdAt")
@@ -662,15 +1051,236 @@ model TeamAuditLog {
   teamId String
   team   CreatorTeam @relation(fields: [teamId], references: [id], onDelete: Cascade)
 
-  action         String // team.created, member.added, member.role_changed, revenue.distributed, ...
-  actorId        String?
-  actorUserId    String?
-  targetMemberId String?
+  action          String // team.created, member.added, member.role_changed, revenue.distributed, ...
+  actorId         String?
+  actorUserId     String?
+  targetMemberId  String?
   targetCreatorId String?
-  metadata       Json?
+  metadata        Json?
 
   createdAt DateTime @default(now())
 
   @@index([teamId, createdAt(sort: Desc)], map: "idx_teamAuditLog_team_createdAt")
   @@index([teamId, action], map: "idx_teamAuditLog_team_action")
+}
+
+enum SubscriptionInterval {
+  DAILY
+  WEEKLY
+  MONTHLY
+  YEARLY
+}
+
+enum SubscriptionStatus {
+  ACTIVE
+  PAUSED
+  PAST_DUE
+  CANCELED
+}
+
+enum ChargeStatus {
+  PENDING
+  SUCCEEDED
+  FAILED
+}
+
+model Subscription {
+  id                 String               @id @default(uuid())
+  supporterId        String
+  creatorId          String
+  amount             Decimal              @db.Decimal(20, 7)
+  interval           SubscriptionInterval
+  status             SubscriptionStatus   @default(ACTIVE)
+  discountPercent    Int                  @default(0)
+  prorateFirst       Boolean              @default(false)
+  currentPeriodStart DateTime
+  nextChargeAt       DateTime
+  failedAttempts     Int                  @default(0)
+  canceledAt         DateTime?
+  createdAt          DateTime             @default(now())
+  updatedAt          DateTime             @updatedAt
+  charges            SubscriptionCharge[]
+
+  @@index([status, nextChargeAt])
+  @@index([creatorId])
+  @@index([supporterId])
+}
+
+model SubscriptionCharge {
+  id             String       @id @default(uuid())
+  subscriptionId String
+  subscription   Subscription @relation(fields: [subscriptionId], references: [id])
+  periodStart    DateTime
+  amount         Decimal      @db.Decimal(20, 7)
+  status         ChargeStatus @default(PENDING)
+  attempt        Int          @default(1)
+  tipId          String?
+  failureReason  String?
+  createdAt      DateTime     @default(now())
+
+  @@unique([subscriptionId, periodStart])
+}
+
+// An abuse report filed against a tip, a user or a creator. It is triaged
+// automatically, investigated by an admin and resolved with a recorded
+// decision; the resolution text and decision stay on the row forever.
+model Report {
+  id         String @id @default(cuid())
+  reporterId String
+
+  targetType String // tip, user, creator
+  targetId   String
+
+  reportType String // spam, harassment, inappropriate, fraud, copyright
+  reason     String
+  details    String?
+
+  status   String @default("reported") // reported, investigating, resolved, dismissed
+  decision String @default("none") // none, approved, denied
+
+  priority     String @default("normal") // low, normal, high, urgent
+  // Numeric mirror of `priority` so the queue can order by urgency in SQL
+  // instead of sorting in the application.
+  priorityRank Int    @default(2)
+
+  resolution String?
+  resolvedBy String?
+  resolvedAt DateTime?
+
+  // Moderator currently looking at it, so two admins do not duplicate the work.
+  assignedTo String?
+
+  // Automatic triage result (spam rules), kept so a decision can be explained.
+  autoFlagged Boolean @default(false)
+  spamScore   Int     @default(0)
+  spamSignals Json    @default("[]")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  appeals ReportAppeal[]
+
+  // Open queue: status filter, then urgency, then oldest first.
+  @@index([status, priorityRank, createdAt], map: "idx_report_status_priority_createdAt")
+  @@index([targetType, targetId], map: "idx_report_target")
+  @@index([reporterId, createdAt(sort: Desc)], map: "idx_report_reporter_createdAt")
+  @@index([reportType, status], map: "idx_report_reportedType_status")
+}
+
+// The author of the moderated content gets one appeal per report.
+model ReportAppeal {
+  id       String @id @default(cuid())
+  reportId String
+  report   Report @relation(fields: [reportId], references: [id], onDelete: Cascade)
+
+  appellantId String
+  message     String
+  status      String    @default("pending") // pending, accepted, rejected
+  notes       String?
+  reviewedBy  String?
+  reviewedAt  DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status, createdAt], map: "idx_reportAppeal_status_createdAt")
+}
+
+// Append-only moderation audit trail: who did what to which target, and why.
+model ModerationAction {
+  id       String  @id @default(cuid())
+  reportId String?
+
+  action String // report.created, report.auto_triaged, report.claimed, report.resolved, report.dismissed, content.hidden, content.restored, content.removed, appeal.filed, appeal.resolved
+
+  targetType String // tip, user, creator
+  targetId   String
+
+  actorId  String // user id, or "system" for automatic actions
+  reason   String?
+  metadata Json    @default("{}")
+
+  createdAt DateTime @default(now())
+
+  @@index([targetType, targetId, createdAt], map: "idx_moderationAction_target_createdAt")
+  @@index([reportId, createdAt], map: "idx_moderationAction_report_createdAt")
+  @@index([action, createdAt], map: "idx_moderationAction_action_createdAt")
+}
+
+// ─── GDPR account deletion (#220) ────────────────────────────────────────────
+
+enum ScheduledDeletionStatus {
+  pending
+  cancelled
+  completed
+}
+
+// A password-confirmed account deletion request. The deletion itself is not
+// immediate: it is queued (BullMQ delayed job, keyed by `id`) to run
+// `GDPR_DELETION_GRACE_DAYS` (30) days after `requestedAt`, and can be
+// cancelled any time before `scheduledFor` via the link in the confirmation
+// email (`cancellationToken`).
+model ScheduledAccountDeletion {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  status ScheduledDeletionStatus @default(pending)
+
+  requestedAt  DateTime
+  scheduledFor DateTime
+
+  // Opaque token embedded in the cancellation link sent by email. Hashed at
+  // rest (same pattern as password reset tokens) so a leaked database row
+  // cannot be used to cancel someone else's deletion.
+  cancellationTokenHash String @unique
+
+  cancelledAt DateTime?
+  completedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId, status])
+  @@index([status, scheduledFor])
+}
+
+// ─── Scheduled payouts (#222) ────────────────────────────────────────────────
+
+enum ScheduledPaymentStatus {
+  active
+  paused
+  cancelled
+}
+
+// A recurring payout a creator has configured for themselves (daily, weekly,
+// monthly, or a custom cron expression). The actual recurrence is driven by a
+// BullMQ repeatable job keyed by this row's id (see
+// src/domains/creators/scheduled-payout.service.ts and
+// src/lib/workers/scheduled-payout.worker.ts): this row is the durable record
+// of what was configured and its run history, not the scheduling mechanism
+// itself.
+model ScheduledPayment {
+  id        String  @id @default(cuid())
+  creatorId String
+  creator   Creator @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+
+  amount        Float
+  walletAddress String?
+
+  // Standard 5-field cron expression (minute hour day-of-month month
+  // day-of-week), e.g. "0 0 * * *" for daily at midnight.
+  cronExpression String
+
+  status ScheduledPaymentStatus @default(active)
+
+  lastRunAt    DateTime?
+  lastPayoutId String?
+  lastRunError String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([creatorId, status])
+  @@index([status])
 }
