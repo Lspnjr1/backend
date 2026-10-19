@@ -1,5 +1,6 @@
 import { Queue, Worker } from 'bullmq';
 import { chargeDueSubscriptions } from '../../domains/subscriptions/subscription.charge';
+import { withJobTracePayload, withWorkerContext, runWithJobContext } from '../requestContext';
 
 const QUEUE_NAME = 'subscription-billing';
 
@@ -17,21 +18,27 @@ export async function startSubscriptionWorker() {
   // Runs every 5 minutes; jobId keeps it from being registered twice
   await queue.add(
     'charge-due',
-    {},
+    withJobTracePayload({}),
     { repeat: { every: 5 * 60 * 1000 }, jobId: 'charge-due-subscriptions' },
   );
 
   const worker = new Worker(
     QUEUE_NAME,
-    async () => {
+    withWorkerContext(async () => {
       const count = await chargeDueSubscriptions();
       return { processed: count };
-    },
+    }),
     { connection },
   );
 
   worker.on('failed', (job, err) => {
-    console.error('[subscription-worker] job failed', job?.id, err);
+    if (job) {
+      runWithJobContext(job, () => {
+        console.error('[subscription-worker] job failed', job?.id, err);
+      });
+    } else {
+      console.error('[subscription-worker] job failed', err);
+    }
   });
 
   return worker;

@@ -4,12 +4,13 @@ import { logger } from '../../utils/logger';
 import { EmailNotification, renderEmail } from '../../domains/notifications/email';
 import { emailNotificationRedis } from '../queue';
 import { PrismaClient } from '@prisma/client';
+import { withWorkerContext, runWithJobContext } from './middleware';
 
 const prisma = new PrismaClient();
 
 export const emailNotificationWorker = new Worker<EmailNotification>(
   'email-notifications',
-  async (job: Job<EmailNotification>) => {
+  withWorkerContext(async (job: Job<EmailNotification>) => {
     if (!config.SENDGRID_API_KEY || !config.EMAIL_FROM) {
       throw new Error('Email delivery is not configured (SENDGRID_API_KEY and EMAIL_FROM are required)');
     }
@@ -43,10 +44,16 @@ export const emailNotificationWorker = new Worker<EmailNotification>(
       throw new Error(`SendGrid rejected email (${response.status})`);
     }
     logger.info({ jobId: job.id, recipient: job.data.to, template: job.data.template }, 'Email delivered');
-  },
+  }),
   { connection: emailNotificationRedis.duplicate() as any, concurrency: 5, limiter: { max: 20, duration: 1000 } },
 );
 
 emailNotificationWorker.on('failed', (job, error) => {
-  logger.error({ jobId: job?.id, err: error }, 'Email job failed');
+  if (job) {
+    runWithJobContext(job, () => {
+      logger.error({ jobId: job?.id, err: error }, 'Email job failed');
+    });
+  } else {
+    logger.error({ err: error }, 'Email job failed');
+  }
 });

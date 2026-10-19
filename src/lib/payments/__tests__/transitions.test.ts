@@ -7,6 +7,9 @@ describe('canTransition', () => {
     expect(canTransition('processing', 'succeeded')).toBe(true);
     expect(canTransition('succeeded', 'refunded')).toBe(true);
     expect(canTransition('succeeded', 'disputed')).toBe(true);
+    expect(canTransition('disputed', 'refunded')).toBe(true);
+    expect(canTransition('disputed', 'succeeded')).toBe(true);
+    expect(canTransition('disputed', 'canceled')).toBe(true);
   });
 
   it('rejects illegal or no-op transitions', () => {

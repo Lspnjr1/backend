@@ -81,6 +81,19 @@ export const QUEUE_NAMES = {
   exports: 'exports',
   deadLetter: 'dead-letter',
   emailNotifications: 'email-notifications',
+  // #220 — delayed job that executes a GDPR account deletion after its grace
+  // period; jobId is the ScheduledAccountDeletion row id so it can be removed
+  // (cancelled) by id before it fires.
+  accountDeletion: 'account-deletion',
+  // #221 — verifies on-chain wallet balance for a tip after it has already
+  // been created (so a slow/congested Stellar RPC call never blocks or times
+  // out the tip creation request); transitions the tip to FAILED on
+  // insufficient balance or a persistent balance-check failure.
+  balanceVerification: 'balance-verification',
+  // #222 — repeatable (cron) jobs that trigger a creator's scheduled payout.
+  // Each ScheduledPayment row's recurring job uses that row's id as the
+  // repeatable job's jobId, so pause/resume/cancel can target it directly.
+  scheduledPayout: 'scheduled-payout',
 } as const;
 
 function createQueue(name: string, connection: ConnectionOptions | RedisClient): Queue {
@@ -91,13 +104,19 @@ function createQueue(name: string, connection: ConnectionOptions | RedisClient):
 }
 
 // ── First-class queues (generic jobs layer) ──────────────────────────────────
-export const stellarConfirmationQueue = createQueue(QUEUE_NAMES.stellarConfirmation, bullConnection);
+export const stellarConfirmationQueue = createQueue(
+  QUEUE_NAMES.stellarConfirmation,
+  bullConnection
+);
 export const webhookDispatchQueue = createQueue(QUEUE_NAMES.webhookDispatch, bullConnection);
 export const emailQueue = createQueue(QUEUE_NAMES.email, bullConnection);
 export const imageProcessingQueue = createQueue(QUEUE_NAMES.imageProcessing, bullConnection);
 export const analyticsQueue = createQueue(QUEUE_NAMES.analytics, bullConnection);
 export const exportsQueue = createQueue(QUEUE_NAMES.exports, bullConnection);
 export const deadLetterQueue = createQueue(QUEUE_NAMES.deadLetter, bullConnection);
+export const accountDeletionQueue = createQueue(QUEUE_NAMES.accountDeletion, bullConnection);
+export const balanceVerificationQueue = createQueue(QUEUE_NAMES.balanceVerification, bullConnection);
+export const scheduledPayoutQueue = createQueue(QUEUE_NAMES.scheduledPayout, bullConnection);
 
 export const allQueues = [
   stellarConfirmationQueue,
@@ -107,6 +126,9 @@ export const allQueues = [
   analyticsQueue,
   exportsQueue,
   deadLetterQueue,
+  accountDeletionQueue,
+  balanceVerificationQueue,
+  scheduledPayoutQueue,
 ];
 
 // ── Email notification queue (dedicated connection) ─────────────────────────
@@ -131,12 +153,21 @@ function attachEvents(name: string, connection: ConnectionOptions | RedisClient)
   return events;
 }
 
-export const stellarConfirmationEvents = attachEvents(QUEUE_NAMES.stellarConfirmation, bullConnection);
+export const stellarConfirmationEvents = attachEvents(
+  QUEUE_NAMES.stellarConfirmation,
+  bullConnection
+);
 export const webhookDispatchEvents = attachEvents(QUEUE_NAMES.webhookDispatch, bullConnection);
 export const emailEvents = attachEvents(QUEUE_NAMES.email, bullConnection);
 export const imageProcessingEvents = attachEvents(QUEUE_NAMES.imageProcessing, bullConnection);
 export const analyticsEvents = attachEvents(QUEUE_NAMES.analytics, bullConnection);
 export const exportsEvents = attachEvents(QUEUE_NAMES.exports, bullConnection);
+export const accountDeletionEvents = attachEvents(QUEUE_NAMES.accountDeletion, bullConnection);
+export const balanceVerificationEvents = attachEvents(
+  QUEUE_NAMES.balanceVerification,
+  bullConnection
+);
+export const scheduledPayoutEvents = attachEvents(QUEUE_NAMES.scheduledPayout, bullConnection);
 export const emailNotificationEvents = attachEvents(
   QUEUE_NAMES.emailNotifications,
   emailNotificationEventsRedis
@@ -208,6 +239,9 @@ export async function closeQueues(): Promise<void> {
     exportsQueue,
     deadLetterQueue,
     emailNotificationQueue,
+    accountDeletionQueue,
+    balanceVerificationQueue,
+    scheduledPayoutQueue,
   ];
   const events = [
     stellarConfirmationEvents,
@@ -217,6 +251,9 @@ export async function closeQueues(): Promise<void> {
     analyticsEvents,
     exportsEvents,
     emailNotificationEvents,
+    accountDeletionEvents,
+    balanceVerificationEvents,
+    scheduledPayoutEvents,
   ];
 
   await Promise.allSettled(queues.map((q) => q.close()));

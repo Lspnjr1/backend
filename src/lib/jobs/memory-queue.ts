@@ -7,6 +7,7 @@ import {
   emptyQueueCounts,
   resolvePriority,
 } from './types';
+import { withJobTracePayload } from '../requestContext';
 
 export type JobProcessor<T = unknown> = (job: JobRecord<T>) => Promise<unknown> | unknown;
 
@@ -40,11 +41,16 @@ export class InMemoryJobQueue implements JobQueue {
       return existing as JobRecord<T>;
     }
 
+    const payload =
+      data !== null && typeof data === 'object'
+        ? (withJobTracePayload(data as unknown as Record<string, unknown>) as unknown as T)
+        : data;
+
     const record: JobRecord<T> = {
       id,
       name: jobName,
       queue: this.name,
-      data,
+      data: payload,
       // Repeatable jobs are registered as waiting; the scheduler re-enqueues them.
       state: options.delay ? 'delayed' : 'waiting',
       progress: 0,

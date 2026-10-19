@@ -1,6 +1,7 @@
 import { Job, Queue, QueueOptions } from 'bullmq';
 import { config } from '../../config';
 import { logger } from '../../utils/logger';
+import { withJobTracePayload } from '../requestContext';
 import {
   EnqueueOptions,
   JobQueue,
@@ -96,7 +97,12 @@ export class BullJobQueue implements JobQueue {
       ? { count: options.keepCompleted }
       : (options.removeOnComplete ?? false);
 
-    const job = await this.queue.add(jobName, data, {
+    const payload =
+      data !== null && typeof data === 'object'
+        ? withJobTracePayload(data as unknown as Record<string, unknown>)
+        : data;
+
+    const job = await this.queue.add(jobName, payload, {
       priority: resolvePriority(options.priority),
       attempts: options.attempts,
       backoff: options.backoff,

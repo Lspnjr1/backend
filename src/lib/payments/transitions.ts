@@ -16,6 +16,10 @@ export const PAYMENT_EVENT_TYPES = {
   REFUND_CREATED: 'refund.created',
   CHARGEBACK_CREATED: 'chargeback.created',
   WEBHOOK_RECEIVED: 'webhook.received',
+  DISPUTE_CREATED: 'payment.disputed',
+  DISPUTE_RESOLVED: 'payment.dispute.resolved',
+  DISPUTE_APPROVED: 'payment.dispute.approved',
+  DISPUTE_REJECTED: 'payment.dispute.rejected',
 } as const;
 
 export type PaymentEventType = (typeof PAYMENT_EVENT_TYPES)[keyof typeof PAYMENT_EVENT_TYPES];
@@ -27,7 +31,7 @@ const ALLOWED_TRANSITIONS: Record<PaymentStatus, PaymentStatus[]> = {
   succeeded: ['refunded', 'partially_refunded', 'disputed'],
   partially_refunded: ['refunded', 'disputed'],
   refunded: ['disputed'],
-  disputed: ['refunded', 'partially_refunded'],
+  disputed: ['refunded', 'partially_refunded', 'succeeded', 'canceled', 'failed'],
   failed: [],
   canceled: [],
 };

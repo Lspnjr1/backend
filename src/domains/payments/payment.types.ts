@@ -1,4 +1,6 @@
 import { z } from 'zod';
+import { MAX_MEDIA_PER_TIP as MAX_TIP_MEDIA } from '../media/media.types';
+import type { MediaView } from '../media/media.types';
 
 /**
  * Tip Status enum representing the lifecycle of a tip transaction
@@ -31,28 +33,32 @@ export const CreateTipSchema = z.object({
    * instead of creating (and charging for) a duplicate.
    */
   idempotencyKey: z.string().trim().min(8).max(255).optional(),
+  assetId: z.string().trim().min(1).max(100).optional(),
+  /**
+   * IDs of previously uploaded media to attach to this tip's message. Each id
+   * must reference media owned by the tipper that finished scanning (`ready`).
+   */
+  mediaIds: z
+    .array(z.string().min(1, 'Media ID is required'))
+    .max(MAX_TIP_MEDIA, `A tip can carry at most ${MAX_TIP_MEDIA} media items`)
+    .optional(),
 });
 
 /**
  * Zod schema for updating tip status
  */
 export const UpdateTipStatusSchema = z.object({
-  status: z.enum(
-    ['pending', 'completed', 'failed', 'cancelled'],
-    { errorMap: () => ({ message: 'Invalid tip status' }) }
-  ),
+  status: z.enum(['pending', 'completed', 'failed', 'cancelled'], {
+    errorMap: () => ({ message: 'Invalid tip status' }),
+  }),
 });
 
 /**
  * Schema for building a payment transaction
  */
 export const BuildPaymentTransactionSchema = z.object({
-  senderPublicKey: z
-    .string()
-    .regex(/^G[A-Z2-7]{55}$/, 'Invalid Stellar public key format'),
-  creatorPublicKey: z
-    .string()
-    .regex(/^G[A-Z2-7]{55}$/, 'Invalid Stellar public key format'),
+  senderPublicKey: z.string().regex(/^G[A-Z2-7]{55}$/, 'Invalid Stellar public key format'),
+  creatorPublicKey: z.string().regex(/^G[A-Z2-7]{55}$/, 'Invalid Stellar public key format'),
   amount: z.string().regex(/^\d+(\.\d{1,7})?$/, 'Invalid amount format'),
   assetCode: z.string().optional(),
   assetIssuer: z.string().optional(),
@@ -65,7 +71,15 @@ export const SubmitPaymentTransactionSchema = z.object({
   transactionEnvelope: z.string().min(1, 'Transaction envelope is required'),
 });
 
-export type CreateTipRequest = z.infer<typeof CreateTipSchema>;
+/**
+ * `currency` is added here (rather than in `CreateTipSchema` above) because the
+ * route layer validates requests with the richer schema in `payment.schemas.ts`
+ * (which already includes `currency`) before calling `PaymentService.createTip`;
+ * this type just needs to describe what the service actually receives (#218).
+ */
+export type CreateTipRequest = z.infer<typeof CreateTipSchema> & {
+  currency?: 'USD' | 'XLM' | 'USDC';
+};
 export type UpdateTipStatusRequest = z.infer<typeof UpdateTipStatusSchema>;
 export type BuildPaymentTransactionRequest = z.infer<typeof BuildPaymentTransactionSchema>;
 export type SubmitPaymentTransactionRequest = z.infer<typeof SubmitPaymentTransactionSchema>;
@@ -81,8 +95,13 @@ export interface TipResponse {
   message: string | null;
   status: TipStatusType;
   transactionHash: string | null;
+  /** Verified media attached to the tip message (#64), in attachment order. */
+  media: MediaView[];
   createdAt: string;
   updatedAt: string;
+  assetCode: string;
+  assetIssuer: string | null;
+  assetDecimals: number;
 }
 
 /**

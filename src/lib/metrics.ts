@@ -99,6 +99,12 @@ export const cacheHitRateGauge = new Gauge({
   help: 'Cache hit rate (0-1)',
 });
 
+export const transactionRetryCounter = new Counter({
+  name: 'dorisio_transaction_retries_total',
+  help: 'Total database transaction retries after a serialization failure or deadlock',
+  labelNames: ['operation', 'reason'],
+});
+
 export function registerPoolMetrics(pool: Pool<any>) {
   // Expose pool stats via gauges
   const poolUsed = new Gauge({ name: 'dorisio_redis_pool_used', help: 'Number of used connections' });

@@ -27,6 +27,18 @@ const adminPermissions = [
 ] as const;
 
 async function main(): Promise<void> {
+  const defaultAssets = [
+    { code: 'XLM', issuer: null, name: 'Stellar Lumens', decimals: 7, priority: 10 },
+    { code: 'USDC', issuer: process.env.USDC_ISSUER ?? null, name: 'USD Coin', decimals: 7, priority: 20 },
+  ] as const;
+  for (const asset of defaultAssets) {
+    await prisma.stellarAsset.upsert({
+      where: { code_issuer: { code: asset.code, issuer: asset.issuer } },
+      create: asset,
+      update: { name: asset.name, decimals: asset.decimals, priority: asset.priority, enabled: true },
+    });
+  }
+
   const roleRecords = new Map<string, { id: string }>();
 
   for (const role of roles) {
@@ -57,7 +69,7 @@ async function main(): Promise<void> {
     });
   }
 
-  console.log(`Seeded ${roles.length} roles and ${adminPermissions.length} admin permissions.`);
+  console.log(`Seeded ${roles.length} roles, ${adminPermissions.length} admin permissions, and ${defaultAssets.length} assets.`);
 }
 
 main()
