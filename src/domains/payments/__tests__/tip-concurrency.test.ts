@@ -7,12 +7,24 @@ vi.mock('../../../lib/queue', () => ({
   webhookDispatchQueue: { add: vi.fn() },
 }));
 
+const { transactionRetryCounterIncMock } = vi.hoisted(() => ({
+  transactionRetryCounterIncMock: vi.fn(),
+}));
+vi.mock('../../../lib/metrics', () => ({
+  transactionRetryCounter: { inc: transactionRetryCounterIncMock },
+}));
+
 // The Stellar SDK/network is not exercised here; stub the transaction helpers so
 // submission paths are deterministic.
 vi.mock('../../../lib/stellar/transactions', () => ({
   buildPaymentTransaction: vi.fn(),
   submitSignedTransaction: vi.fn(),
   checkTransactionStatus: vi.fn(),
+}));
+
+// Stub getWalletBalance so balance checks don't hit the network.
+vi.mock('../../../lib/stellar/wallet', () => ({
+  getWalletBalance: vi.fn().mockResolvedValue({ lumens: '100', usdc: '1000' }),
 }));
 
 import { PaymentService } from '../payment.service';
@@ -27,6 +39,7 @@ const mockPrisma = {
   creator: { findUnique: vi.fn(), update: vi.fn() },
   user: { findUnique: vi.fn() },
   wallet: { findFirst: vi.fn() },
+  stellarAsset: { findFirst: vi.fn() },
   walletFlag: { findFirst: vi.fn() },
   accountFreeze: { findFirst: vi.fn() },
   webhook: { findMany: vi.fn() },
@@ -65,6 +78,8 @@ describe('createTip idempotency (#48)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     service = new PaymentService(mockPrisma as any);
+    mockPrisma.webhook.findMany.mockResolvedValue([]);
+
     mockPrisma.user.findUnique.mockResolvedValue({ id: userId });
     mockPrisma.creator.findUnique.mockResolvedValue({
       id: creatorId,
@@ -72,9 +87,20 @@ describe('createTip idempotency (#48)', () => {
       isPublic: true,
       verified: true,
     });
-    mockPrisma.wallet.findFirst.mockResolvedValue({ id: 'wallet-1', publicKey: 'GABC', verified: true });
+    mockPrisma.wallet.findFirst.mockResolvedValue({
+      id: 'wallet-1',
+      publicKey: 'GABC',
+      verified: true,
+    });
     mockPrisma.walletFlag.findFirst.mockResolvedValue(null);
     mockPrisma.accountFreeze.findFirst.mockResolvedValue(null);
+    mockPrisma.stellarAsset.findFirst.mockResolvedValue({
+      id: 'asset-usdc',
+      code: 'USDC',
+      issuer: 'GUSDCISSUER',
+      enabled: true,
+      priority: 100,
+    });
   });
 
   it('returns the original tip when an idempotency key is replayed', async () => {
@@ -101,7 +127,9 @@ describe('createTip idempotency (#48)', () => {
 
   it('persists the idempotency key on first submission', async () => {
     mockPrisma.tip.findUnique.mockResolvedValue(null);
-    mockPrisma.tip.create.mockResolvedValue(makeTipRow({ id: 'tip-new', idempotencyKey: 'key-12345678' }));
+    mockPrisma.tip.create.mockResolvedValue(
+      makeTipRow({ id: 'tip-new', idempotencyKey: 'key-12345678' })
+    );
 
     await service.createTip(userId, { creatorId, amount: 25, idempotencyKey: 'key-12345678' });
 
@@ -194,6 +222,74 @@ describe('updateTipStatus optimistic locking (#48)', () => {
     );
     expect(mockPrisma.creator.update).not.toHaveBeenCalled();
   });
+
+  it('runs the transaction at Serializable isolation (issue #208)', async () => {
+    mockPrisma.tip.findUnique.mockResolvedValueOnce(makeTipRow({ version: 0 }));
+    mockPrisma.tip.updateMany.mockResolvedValue({ count: 1 });
+    mockPrisma.creator.update.mockResolvedValue({ id: 'creator-123' });
+
+    await service.updateTipStatus('tip-123', { status: 'completed' });
+
+    expect(mockPrisma.$transaction).toHaveBeenCalledTimes(1);
+    const options = mockPrisma.$transaction.mock.calls[0][1];
+    expect(options).toEqual({ isolationLevel: 'Serializable' });
+  });
+
+  it('retries after a Postgres serialization failure (P2034) and records the metric', async () => {
+    mockPrisma.tip.findUnique
+      .mockResolvedValueOnce(makeTipRow({ version: 0 }))
+      .mockResolvedValueOnce(makeTipRow({ version: 0 }));
+    mockPrisma.tip.updateMany.mockResolvedValue({ count: 1 });
+    mockPrisma.creator.update
+      .mockRejectedValueOnce(
+        Object.assign(new Error('could not serialize access'), { code: 'P2034' })
+      )
+      .mockResolvedValueOnce({ id: 'creator-123' });
+
+    const result = await service.updateTipStatus('tip-123', { status: 'completed' });
+
+    expect(result.status).toBe('completed');
+    expect(mockPrisma.$transaction).toHaveBeenCalledTimes(2);
+    expect(transactionRetryCounterIncMock).toHaveBeenCalledWith({
+      operation: 'payment.updateTipStatus',
+      reason: 'serialization_failure',
+    });
+  });
+
+  it('retries after a transaction timeout/deadlock (P2028) and records the metric', async () => {
+    mockPrisma.tip.findUnique
+      .mockResolvedValueOnce(makeTipRow({ version: 0 }))
+      .mockResolvedValueOnce(makeTipRow({ version: 0 }));
+    mockPrisma.tip.updateMany.mockResolvedValue({ count: 1 });
+    mockPrisma.creator.update
+      .mockRejectedValueOnce(Object.assign(new Error('transaction timed out'), { code: 'P2028' }))
+      .mockResolvedValueOnce({ id: 'creator-123' });
+
+    const result = await service.updateTipStatus('tip-123', { status: 'completed' });
+
+    expect(result.status).toBe('completed');
+    expect(transactionRetryCounterIncMock).toHaveBeenCalledWith({
+      operation: 'payment.updateTipStatus',
+      reason: 'deadlock',
+    });
+  });
+
+  it('records the optimistic_lock reason when retrying a version conflict', async () => {
+    mockPrisma.tip.findUnique
+      .mockResolvedValueOnce(makeTipRow({ version: 0 }))
+      .mockResolvedValueOnce(makeTipRow({ version: 1 }));
+    mockPrisma.tip.updateMany
+      .mockResolvedValueOnce({ count: 0 })
+      .mockResolvedValueOnce({ count: 1 });
+    mockPrisma.creator.update.mockResolvedValue({ id: 'creator-123' });
+
+    await service.updateTipStatus('tip-123', { status: 'completed' });
+
+    expect(transactionRetryCounterIncMock).toHaveBeenCalledWith({
+      operation: 'payment.updateTipStatus',
+      reason: 'optimistic_lock',
+    });
+  });
 });
 
 describe('submitPaymentTransaction duplicate submission (#48)', () => {
@@ -202,6 +298,7 @@ describe('submitPaymentTransaction duplicate submission (#48)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     service = new PaymentService(mockPrisma as any);
+    mockPrisma.webhook.findMany.mockResolvedValue([]);
   });
 
   it('replays an already-stored transaction instead of submitting again', async () => {

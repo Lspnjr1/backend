@@ -8,6 +8,8 @@ export interface JwtPayload extends BaseJwtPayload {
   role: string;
   authVersion?: number;
   jti?: string;
+  /** Session-bound CSRF synchronizer token (#191). */
+  csrf?: string;
 }
 
 export interface RefreshTokenPayload extends BaseJwtPayload {

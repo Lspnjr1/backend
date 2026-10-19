@@ -21,7 +21,7 @@ export const CreatePaymentSchema = z.object({
   creatorId: z.string().trim().min(1).max(100).optional(),
   description: z.string().trim().max(500).optional(),
   /** Optional alternative to the `Idempotency-Key` header. */
-  idempotencyKey: z.string().trim().min(8).max(255).optional(),
+  idempotencyKey: z.string().uuid('Idempotency key must be a valid UUID v4').optional(),
 });
 
 /**
@@ -35,7 +35,7 @@ export const RefundPaymentSchema = z.object({
     .max(MAX_PAYMENT_AMOUNT)
     .optional(),
   reason: z.enum(['requested_by_customer', 'duplicate', 'fraudulent']).optional(),
-  idempotencyKey: z.string().trim().min(8).max(255).optional(),
+  idempotencyKey: z.string().uuid('Idempotency key must be a valid UUID v4').optional(),
 });
 
 export const PaymentIdParamsSchema = z.object({

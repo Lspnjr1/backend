@@ -37,6 +37,8 @@ import { authMiddleware } from '../../middleware/auth';
 import {
   createCreatorTierRuntime,
   type CreatorTierRuntime,
+  calculateCreatorTierProgression,
+  CREATOR_MONETIZATION_TIERS,
 } from './tier.runtime';
 import type { CreatorBillingPeriod } from './tier.service';
 
@@ -100,14 +102,67 @@ export const registerCreatorTierRoutes = (
     );
   });
 
-  app.get(
-    '/api/v1/creators/me/tier',
-    { preHandler: [authMiddleware, ownedByCaller] },
-    async (request: FastifyRequest, reply: FastifyReply) => {
-      const userId = request.user!.userId;
-      reply.send(formatSuccess(await service.getSubscription(userId)));
-    }
-  );
+  const handleGetTier = async (request: FastifyRequest, reply: FastifyReply) => {
+    const userId = request.user!.userId;
+    const context = getCreatorTierContext(request)!;
+    const subscription = await service.getSubscription(userId);
+
+    const query = request.query as Record<string, string | undefined> | undefined;
+    const simulateEarnings = query?.simulateEarnings ? Number(query.simulateEarnings) : undefined;
+    const simulateFollowers = query?.simulateFollowers ? Number(query.simulateFollowers) : undefined;
+
+    const creator = await prisma.creator.findUnique({
+      where: { id: context.creatorId },
+      select: {
+        id: true,
+        totalEarnings: true,
+        _count: {
+          select: {
+            tips: true,
+          },
+        },
+      },
+    });
+
+    const earnings = simulateEarnings ?? (creator?.totalEarnings ?? 0);
+    const followers = simulateFollowers ?? (creator?._count?.tips ?? 0);
+
+    const progression = calculateCreatorTierProgression(
+      earnings,
+      followers,
+      context.subscribedTier
+    );
+
+    reply.send(
+      formatSuccess({
+        tier: subscription.tier,
+        subscribedTier: subscription.subscribedTier,
+        status: subscription.status,
+        billingPeriod: subscription.billingPeriod,
+        plan: subscription.plan,
+        trialEndsAt: subscription.trialEndsAt,
+        trialDaysRemaining: subscription.trialDaysRemaining,
+        currentPeriodStart: subscription.currentPeriodStart,
+        currentPeriodEnd: subscription.currentPeriodEnd,
+        cancelAtPeriodEnd: subscription.cancelAtPeriodEnd,
+        nextTier: progression.nextTier?.tier ?? subscription.nextTier,
+        provider: subscription.provider,
+        priceCents: subscription.priceCents,
+        upgradeOptions: subscription.upgradeOptions,
+        // Monetization tier progression details (#197)
+        tierName: progression.tierName,
+        benefits: progression.benefits,
+        metrics: progression.metrics,
+        progress: progression.progress,
+        progression,
+        simulation: progression.simulation,
+        roadmap: progression.roadmap,
+      })
+    );
+  };
+
+  app.get('/api/creators/me/tier', { preHandler: [authMiddleware, ownedByCaller] }, handleGetTier);
+  app.get('/api/v1/creators/me/tier', { preHandler: [authMiddleware, ownedByCaller] }, handleGetTier);
 
   app.get(
     '/api/v1/creators/me/tier/usage',

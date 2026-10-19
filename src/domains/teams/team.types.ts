@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { sanitizeText, TEXT_LIMITS } from '../../utils/sanitization';
 
 /**
  * Team / organization support for creators.
@@ -126,9 +127,19 @@ const slugSchema = z
   .regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/, 'Slug must contain lowercase letters, numbers and dashes');
 
 export const CreateTeamSchema = z.object({
-  name: z.string().trim().min(TEAM_LIMITS.MIN_NAME_LENGTH).max(TEAM_LIMITS.MAX_NAME_LENGTH),
+  name: z
+    .string()
+    .trim()
+    .transform((value) => sanitizeText(value, { maxLength: TEXT_LIMITS.TEAM_NAME }))
+    .min(TEAM_LIMITS.MIN_NAME_LENGTH)
+    .max(TEAM_LIMITS.MAX_NAME_LENGTH),
   slug: slugSchema.optional(),
-  description: z.string().trim().max(TEAM_LIMITS.MAX_DESCRIPTION_LENGTH).optional(),
+  description: z
+    .string()
+    .trim()
+    .transform((value) => sanitizeText(value, { maxLength: TEXT_LIMITS.TEAM_DESCRIPTION }))
+    .max(TEAM_LIMITS.MAX_DESCRIPTION_LENGTH)
+    .optional(),
   avatar: z.string().url().optional(),
   isPublic: z.boolean().optional(),
   /** Initial collective payout mode; defaults to the team payout account. */
@@ -137,8 +148,19 @@ export const CreateTeamSchema = z.object({
 
 export const UpdateTeamSchema = z
   .object({
-    name: z.string().trim().min(TEAM_LIMITS.MIN_NAME_LENGTH).max(TEAM_LIMITS.MAX_NAME_LENGTH).optional(),
-    description: z.string().trim().max(TEAM_LIMITS.MAX_DESCRIPTION_LENGTH).optional(),
+    name: z
+      .string()
+      .trim()
+      .transform((value) => sanitizeText(value, { maxLength: TEXT_LIMITS.TEAM_NAME }))
+      .min(TEAM_LIMITS.MIN_NAME_LENGTH)
+      .max(TEAM_LIMITS.MAX_NAME_LENGTH)
+      .optional(),
+    description: z
+      .string()
+      .trim()
+      .transform((value) => sanitizeText(value, { maxLength: TEXT_LIMITS.TEAM_DESCRIPTION }))
+      .max(TEAM_LIMITS.MAX_DESCRIPTION_LENGTH)
+      .optional(),
     avatar: z.string().url().optional(),
     isPublic: z.boolean().optional(),
   })

@@ -280,6 +280,10 @@ DATABASE_URL={{ DATABASE_URL }}
 JWT_SECRET={{ JWT_SECRET }}
 ```
 
+Production Kubernetes synchronizes AWS Secrets Manager versions through
+External Secrets Operator; rotation, IAM scope, CloudTrail auditing, and
+rollout steps are documented in [the secret-management runbook](docs/runbooks/secrets.md).
+
 **Feature flags** toggle features per environment with `FEATURE_*` variables
 and are read in code via `isFeatureEnabled('<name>')` from `src/config`:
 

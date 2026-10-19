@@ -1,5 +1,6 @@
 import { Job, Worker, WorkerOptions } from 'bullmq';
 import { logger } from '../../utils/logger';
+import { withWorkerContext, runWithJobContext } from '../requestContext';
 import { redisConnectionOptions, toJobRecord } from './bull-queue';
 import { DeadLetterManager, isExhausted } from './dead-letter';
 import { createJobEvent, jobEvents, JobEventBus } from './events';
@@ -33,13 +34,13 @@ export function createWorker(
 
   const worker = new Worker(
     queueName,
-    async (job: Job) => {
+    withWorkerContext(async (job: Job) => {
       const processor = processors[job.name];
       if (!processor) {
         throw new Error(`No processor registered for job "${job.name}" on queue "${queueName}"`);
       }
       return processor(job.data, toJobRecord(job));
-    },
+    }),
     {
       connection: redisConnectionOptions(),
       concurrency: options.concurrency ?? 5,
@@ -69,11 +70,48 @@ export function createWorker(
       return;
     }
 
-    const attemptsMade = job.attemptsMade;
-    const maxAttempts = job.opts.attempts ?? 1;
+    runWithJobContext(job, () => {
+      const attemptsMade = job.attemptsMade;
+      const maxAttempts = job.opts.attempts ?? 1;
 
-    if (isExhausted(attemptsMade, maxAttempts)) {
-      recordJobProcessed(queueName, job.name, 'failed');
+      if (isExhausted(attemptsMade, maxAttempts)) {
+        recordJobProcessed(queueName, job.name, 'failed');
+        events.emit(
+          createJobEvent('failed', {
+            queue: queueName,
+            jobId: String(job.id),
+            name: job.name,
+            error: error?.message,
+            attemptsMade,
+            state: 'failed',
+          })
+        );
+
+        if (deadLetters) {
+          void deadLetters
+            .add(toJobRecord(job), error)
+            .then((record) => {
+              logger.error(
+                { queue: queueName, jobId: job.id, dlqJobId: record.id },
+                'Job exhausted retries and was dead-lettered'
+              );
+              events.emit(
+                createJobEvent('dead-letter', {
+                  queue: queueName,
+                  jobId: String(job.id),
+                  name: job.name,
+                  error: error?.message,
+                  attemptsMade,
+                  state: 'failed',
+                })
+              );
+            })
+            .catch((err) => logger.error({ err }, 'Failed to dead-letter job'));
+        }
+        return;
+      }
+
+      recordJobRetry(queueName, job.name);
       events.emit(
         createJobEvent('failed', {
           queue: queueName,
@@ -81,45 +119,10 @@ export function createWorker(
           name: job.name,
           error: error?.message,
           attemptsMade,
-          state: 'failed',
+          state: 'waiting',
         })
       );
-
-      if (deadLetters) {
-        void deadLetters
-          .add(toJobRecord(job), error)
-          .then((record) => {
-            logger.error(
-              { queue: queueName, jobId: job.id, dlqJobId: record.id },
-              'Job exhausted retries and was dead-lettered'
-            );
-            events.emit(
-              createJobEvent('dead-letter', {
-                queue: queueName,
-                jobId: String(job.id),
-                name: job.name,
-                error: error?.message,
-                attemptsMade,
-                state: 'failed',
-              })
-            );
-          })
-          .catch((err) => logger.error({ err }, 'Failed to dead-letter job'));
-      }
-      return;
-    }
-
-    recordJobRetry(queueName, job.name);
-    events.emit(
-      createJobEvent('failed', {
-        queue: queueName,
-        jobId: String(job.id),
-        name: job.name,
-        error: error?.message,
-        attemptsMade,
-        state: 'waiting',
-      })
-    );
+    });
   });
 
   worker.on('progress', (job: Job, progress: number) => {

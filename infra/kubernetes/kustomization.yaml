@@ -4,7 +4,8 @@ namespace: dorisio
 resources:
   - namespace.yaml
   - configmap.yaml
-  - secret.example.yaml
+  - secret-store.aws.yaml
+  - external-secret.aws.yaml
   - service.yaml
   - rollout.yaml
   - hpa.yaml
