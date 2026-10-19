@@ -1,7 +1,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-vi.mock('../../lib/cache/cache-aside', () => ({
+vi.mock('../../../lib/cache/cache-aside', () => ({
   CacheType: { USER: 'user' },
   createCacheKey: (type: string, id: string) => `${type}:${id}`,
   getOrFetch: async ({ fetchFn }: { fetchFn: () => Promise<unknown> }) => fetchFn(),
@@ -9,15 +9,15 @@ vi.mock('../../lib/cache/cache-aside', () => ({
   invalidate: async () => undefined,
 }));
 
-vi.mock('../../utils/token-blacklist', () => ({
+vi.mock('../../../utils/token-blacklist', () => ({
   blacklistToken: vi.fn(async () => undefined),
 }));
 
 import { UserService } from '../user.service';
 import { AVATAR_MAX_BYTES, decodeAvatarDataUrl } from '../avatar.storage';
-import { hashPassword } from '../../utils/password';
-import { ValidationError } from '../../utils/errors';
-import { blacklistToken } from '../../utils/token-blacklist';
+import { hashPassword } from '../../../utils/password';
+import { ValidationError } from '../../../utils/errors';
+import { blacklistToken } from '../../../utils/token-blacklist';
 
 /** Minimal in-memory Prisma stand-in covering the models UserService touches. */
 class FakePrisma {
@@ -68,6 +68,7 @@ const seedUser = (prisma: FakePrisma, overrides: Record<string, unknown> = {}) =
     name: 'Old Name',
     bio: null,
     avatar: null,
+    phoneNumber: null,
     password: 'hashed',
     role: 'fan',
     verified: false,
@@ -111,6 +112,52 @@ describe('UserService profile management (#49)', () => {
 
   it('only audits fields whose value actually changed', async () => {
     await service.updateUserProfile('u1', { name: 'Old Name' });
+    expect(prisma.changes).toHaveLength(0);
+  });
+
+  it('stores the phone number in normalized E.164 format and audits the change', async () => {
+    const result = await service.updateUserProfile(
+      'u1',
+      { phoneNumber: '(415) 555-2671' },
+      { ip: '1.2.3.4', userAgent: 'vitest' }
+    );
+
+    expect(result.phoneNumber).toBe('+14155552671');
+    expect(prisma.users[0].phoneNumber).toBe('+14155552671');
+
+    expect(prisma.changes).toHaveLength(1);
+    expect(prisma.changes[0].field).toBe('phoneNumber');
+    expect(prisma.changes[0].oldValue).toBeNull();
+    expect(prisma.changes[0].newValue).toBe('+14155552671');
+    expect(prisma.changes[0].sensitive).toBe(true);
+    expect(prisma.changes[0].ip).toBe('1.2.3.4');
+  });
+
+  it('normalizes international phone numbers to E.164', async () => {
+    await service.updateUserProfile('u1', { phoneNumber: '+49 89 123456' });
+    expect(prisma.users[0].phoneNumber).toBe('+4989123456');
+
+    await service.updateUserProfile('u1', { phoneNumber: '+44 7912 345678' });
+    expect(prisma.users[0].phoneNumber).toBe('+447912345678');
+  });
+
+  it('clears the phone number when null is provided', async () => {
+    prisma.users[0].phoneNumber = '+14155552671';
+
+    const result = await service.updateUserProfile('u1', { phoneNumber: null });
+
+    expect(result.phoneNumber).toBeNull();
+    expect(prisma.users[0].phoneNumber).toBeNull();
+
+    const change = prisma.changes.find((change) => change.field === 'phoneNumber');
+    expect(change.newValue).toBeNull();
+    expect(change.oldValue).toBe('+14155552671');
+  });
+
+  it('does not audit the phone number when it is unchanged', async () => {
+    prisma.users[0].phoneNumber = '+14155552671';
+
+    await service.updateUserProfile('u1', { phoneNumber: '+14155552671' });
     expect(prisma.changes).toHaveLength(0);
   });
 

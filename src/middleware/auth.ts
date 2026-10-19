@@ -4,6 +4,8 @@ import { UnauthorizedError } from '../utils/errors';
 import { isTokenBlacklisted, isUserAuthVersionCurrent } from '../utils/token-blacklist';
 import { setRequestContextUserId } from '../lib/requestContext';
 import { registerAuthGuard } from './auth-guards';
+import { verifyApiKey } from '../domains/developers/api-key-auth';
+import { API_KEY_PREFIX } from '../domains/developers/api-key.constants';
 
 declare module 'fastify' {
   interface FastifyInstance {
@@ -11,7 +13,34 @@ declare module 'fastify' {
   }
   interface FastifyRequest {
     user?: { userId: string; email: string; role: string };
+    apiKey?: { apiKeyId: string; permissions: string[] };
   }
+}
+
+/**
+ * Developer API key fallback (issue #213): a `Bearer` credential that
+ * starts with the API key prefix is verified against `ApiKey` instead of
+ * being parsed as a JWT. On success, `request.user` is populated with the
+ * key owner's identity (role left empty — API keys authenticate, they
+ * don't carry a dashboard role) and `request.apiKey` records which key and
+ * scopes were used, so a route can enforce a specific permission.
+ */
+async function tryApiKeyAuth(request: FastifyRequest, token: string): Promise<boolean> {
+  if (!token.startsWith(API_KEY_PREFIX)) return false;
+
+  const verification = await verifyApiKey(token, {
+    method: request.method,
+    path: request.url,
+    ip: request.ip,
+  });
+  if (!verification) {
+    throw new UnauthorizedError('Invalid or revoked API key');
+  }
+
+  request.user = { userId: verification.userId, email: '', role: '' };
+  request.apiKey = { apiKeyId: verification.apiKeyId, permissions: verification.permissions };
+  setRequestContextUserId(verification.userId);
+  return true;
 }
 
 export const authMiddleware = async (
@@ -25,7 +54,11 @@ export const authMiddleware = async (
     }
 
     const token = authHeader.substring(7);
-    
+
+    if (await tryApiKeyAuth(request, token)) {
+      return;
+    }
+
     // Check if token is blacklisted
     const isBlacklisted = await isTokenBlacklisted(token);
     if (isBlacklisted) {
@@ -59,7 +92,7 @@ export const optionalAuthMiddleware = async (
     const authHeader = request.headers.authorization;
     if (authHeader?.startsWith('Bearer ')) {
       const token = authHeader.substring(7);
-      
+
       // Check if token is blacklisted
       const isBlacklisted = await isTokenBlacklisted(token);
       if (isBlacklisted) {
@@ -71,6 +104,7 @@ export const optionalAuthMiddleware = async (
         return;
       }
       request.user = payload;
+      setRequestContextUserId(payload.userId);
     }
   } catch {
     // Silently ignore if token is invalid for optional auth

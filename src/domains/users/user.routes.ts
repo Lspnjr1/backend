@@ -7,6 +7,8 @@ import {
   UpdateAvatarRequestSchema,
   UpdateUserProfileSchema,
   UpdateUserSettingsSchema,
+  RequestEmailChangeSchema,
+  VerifyEmailChangeSchema,
 } from './user.types';
 import { formatSuccess, formatError } from '../../types/response';
 import { authMiddleware } from '../../middleware/auth';
@@ -103,20 +105,25 @@ export const registerUserRoutes = (app: FastifyInstance, prisma: PrismaClient): 
 
   const updateProfileOptions = {
     preHandler: authMiddleware,
-    schema: {
-      body: {
-        type: 'object',
-        properties: {
-          name: { type: 'string', description: 'Display name' },
-          bio: { type: 'string', description: 'User bio' },
+      schema: {
+        body: {
+          type: 'object',
+          properties: {
+            name: { type: 'string', description: 'Display name' },
+            bio: { type: 'string', description: 'User bio' },
+            phoneNumber: {
+              type: 'string',
+              description:
+                'Phone number in any common format; stored normalized to E.164 (e.g. +14155552671)',
+            },
+          },
+        },
+        response: {
+          200: { description: 'Profile updated' },
+          400: { description: 'Validation error' },
+          401: { description: 'Unauthorized' },
         },
       },
-      response: {
-        200: { description: 'Profile updated' },
-        400: { description: 'Validation error' },
-        401: { description: 'Unauthorized' },
-      },
-    },
   };
 
   app.patch('/api/v1/users/profile', updateProfileOptions, updateProfileHandler);
@@ -282,4 +289,34 @@ export const registerUserRoutes = (app: FastifyInstance, prisma: PrismaClient): 
       }
     }
   );
+
+  // POST /api/users/email/change and /api/v1/users/email/change - Initiate email change (#196)
+  const emailChangeHandler: RouteHandlerMethod = async (request, reply) => {
+    try {
+      const userId = loadUserId(request);
+      const body = RequestEmailChangeSchema.parse(request.body);
+      const result = await userService.requestEmailChange(userId, body.newEmail, requestContext(request));
+      reply.send(formatSuccess(result));
+    } catch (error) {
+      sendError(reply, error);
+    }
+  };
+
+  app.post('/api/users/email/change', { preHandler: authMiddleware }, emailChangeHandler);
+  app.post('/api/v1/users/email/change', { preHandler: authMiddleware }, emailChangeHandler);
+
+  // POST /api/users/email/verify and /api/v1/users/email/verify - Confirm email change (#196)
+  const emailVerifyHandler: RouteHandlerMethod = async (request, reply) => {
+    try {
+      const body = VerifyEmailChangeSchema.parse(request.body);
+      const result = await userService.verifyEmailChange(body.token, requestContext(request));
+      reply.send(formatSuccess(result));
+    } catch (error) {
+      sendError(reply, error);
+    }
+  };
+
+  app.post('/api/users/email/verify', emailVerifyHandler);
+  app.post('/api/v1/users/email/verify', emailVerifyHandler);
 };
+

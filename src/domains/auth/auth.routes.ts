@@ -20,6 +20,7 @@ import { verifyToken } from '../../utils/jwt';
 import { config } from '../../config/env';
 import { z } from 'zod';
 import { ValidationError } from '../../utils/errors';
+import { SessionService } from './session.service';
 
 const VerifyEmailSchema = z.object({
   token: z.string().min(1, 'Verification token is required'),
@@ -127,10 +128,14 @@ export const registerAuthRoutes = (app: FastifyInstance, prisma: PrismaClient): 
     },
     async (request: FastifyRequest, reply: FastifyReply) => {
       const body = LoginRequestSchema.parse(request.body);
-      const result = await authService.login(body);
+      const result = await authService.login(body, {
+        ipAddress: request.ip,
+        userAgent: typeof request.headers['user-agent'] === 'string' ? request.headers['user-agent'] : undefined,
+        device: typeof request.headers['sec-ch-ua-platform'] === 'string' ? request.headers['sec-ch-ua-platform'] : undefined,
+      });
       
       // Set refresh token as httpOnly cookie
-      reply.setCookie('refreshToken', result.refreshToken, {
+      (reply as any).setCookie('refreshToken', result.refreshToken, {
         httpOnly: true,
         secure: config.NODE_ENV === 'production',
         sameSite: 'strict',
@@ -179,7 +184,7 @@ export const registerAuthRoutes = (app: FastifyInstance, prisma: PrismaClient): 
       const result = await authService.refreshAccessToken(body.refreshToken);
       
       // Set new refresh token as httpOnly cookie
-      reply.setCookie('refreshToken', result.refreshToken, {
+      (reply as any).setCookie('refreshToken', result.refreshToken, {
         httpOnly: true,
         secure: config.NODE_ENV === 'production',
         sameSite: 'strict',
@@ -238,7 +243,7 @@ export const registerAuthRoutes = (app: FastifyInstance, prisma: PrismaClient): 
     async (request: FastifyRequest, reply: FastifyReply) => {
       const body = PasswordResetConfirmRequestSchema.parse(request.body);
       const result = await authService.confirmPasswordReset(body.token, body.newPassword);
-      reply.clearCookie('refreshToken', { path: '/' });
+      (reply as any).clearCookie('refreshToken', { path: '/' });
       reply.send(formatSuccess(result));
     }
   );
@@ -304,13 +309,27 @@ export const registerAuthRoutes = (app: FastifyInstance, prisma: PrismaClient): 
       }
 
       // Clear refresh token cookie
-      reply.clearCookie('refreshToken', {
+      (reply as any).clearCookie('refreshToken', {
         path: '/',
       });
 
       reply.send(formatSuccess({ message: 'Logged out successfully' }));
     }
   );
+
+  app.get('/api/v1/auth/sessions', { preHandler: authMiddleware }, async (request, reply) => {
+    reply.send(formatSuccess(await new SessionService(prisma).list(request.user!.userId)));
+  });
+
+  app.delete<{ Params: { id: string } }>('/api/v1/auth/sessions/:id', { preHandler: authMiddleware }, async (request, reply) => {
+    await new SessionService(prisma).revoke(request.user!.userId, request.params.id);
+    reply.send(formatSuccess({ message: 'Session revoked' }));
+  });
+
+  app.post('/api/v1/auth/sessions/revoke-all', { preHandler: authMiddleware }, async (request, reply) => {
+    await new SessionService(prisma).revokeAll(request.user!.userId);
+    reply.send(formatSuccess({ message: 'All sessions revoked' }));
+  });
 
   // POST /api/v1/auth/verify-email - Verify email with token
   app.post<{ Body: { token: string } }>(

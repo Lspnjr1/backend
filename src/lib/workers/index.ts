@@ -1,3 +1,4 @@
+import type { PrismaClient } from '@prisma/client';
 import { config } from '../../config/env';
 import { logger } from '../../utils/logger';
 import { CRON_PRESETS, scheduleJob } from '../jobs/scheduler';
@@ -9,6 +10,9 @@ import { createExportsWorker } from './exports.worker';
 import { createImageProcessingWorker } from './image-processing.worker';
 import { createStellarConfirmationWorker } from './stellar-confirmation.worker';
 import { createWebhookDispatchWorker } from './webhook-dispatch.worker';
+import { createAccountDeletionWorker } from './account-deletion.worker';
+import { createBalanceVerificationWorker } from './balance-verification.worker';
+import { createScheduledPayoutWorker } from './scheduled-payout.worker';
 
 /**
  * Registers the recurring jobs workers rely on. Idempotent: repeatable jobs
@@ -22,14 +26,21 @@ async function registerScheduledJobs(): Promise<void> {
   });
 }
 
-export async function startWorkers() {
+/**
+ * Start the worker pool. `prisma` is forwarded to the workers that need database
+ * access (media processing); workers that only touch Redis or Stellar ignore it.
+ */
+export async function startWorkers(prisma?: PrismaClient) {
   const workers = [
     createStellarConfirmationWorker(),
     createWebhookDispatchWorker(),
     createEmailWorker(),
-    createImageProcessingWorker(),
+    createImageProcessingWorker(prisma),
     createAnalyticsWorker(),
     createExportsWorker(),
+    createAccountDeletionWorker(prisma),
+    createBalanceVerificationWorker(prisma),
+    createScheduledPayoutWorker(prisma),
   ];
 
   await registerScheduledJobs();

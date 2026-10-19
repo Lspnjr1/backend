@@ -6,6 +6,7 @@ import { FakePaymentProvider } from '../../../lib/payments/provider';
 import { generateAccessToken } from '../../../utils/jwt';
 import { AppError } from '../../../utils/errors';
 import { applyJsonSerializer } from '../../../config/serialization';
+import { initTokenBlacklist } from '../../../utils/token-blacklist';
 
 function tokenFor(userId: string): string {
   return generateAccessToken({ userId, email: `${userId}@test.com`, role: 'fan' });
@@ -14,6 +15,8 @@ function tokenFor(userId: string): string {
 function buildApp(prisma: FakePrisma, provider: FakePaymentProvider): FastifyInstance {
   const app = Fastify({ logger: false });
   applyJsonSerializer(app);
+  // Wire up the fake prisma so auth middleware can verify token validity
+  initTokenBlacklist(prisma as never);
   app.setErrorHandler((error, _request, reply) => {
     if (error instanceof AppError) {
       reply.code(error.statusCode).send({ code: error.code, message: error.message });
@@ -55,7 +58,7 @@ describe('payment routes', () => {
     const res = await app.inject({
       method: 'POST',
       url: '/api/v1/payments',
-      headers: { authorization: `Bearer ${tokenFor('user-1')}`, 'idempotency-key': 'route-key-1' },
+      headers: { authorization: `Bearer ${tokenFor('user-1')}`, 'idempotency-key': 'c0ffee00-0000-4000-a000-000000000001' },
       payload: { amount: 10, currency: 'USD', method: 'card' },
     });
 
@@ -125,7 +128,7 @@ describe('payment routes', () => {
     const res = await app.inject({
       method: 'POST',
       url: `/api/v1/payments/${id}/refund`,
-      headers: { ...auth, 'idempotency-key': 'refund-route-1' },
+      headers: { ...auth, 'idempotency-key': 'c0ffee00-0000-4000-a000-000000000002' },
       payload: {},
     });
 
@@ -163,5 +166,124 @@ describe('payment routes', () => {
     });
 
     expect(res.statusCode).toBe(401);
+  });
+
+  describe('idempotency key validation', () => {
+    const VALID_UUID = '550e8400-e29b-41d4-a716-446655440000';
+    const VALID_UUID_2 = '6ba7b810-9dad-11d1-80b4-00c04fd430c8';
+    const authHeaders = () => ({ authorization: `Bearer ${tokenFor('user-1')}` });
+
+    it('rejects a non-UUID Idempotency-Key header → 400', async () => {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/v1/payments',
+        headers: { ...authHeaders(), 'idempotency-key': 'not-a-uuid' },
+        payload: { amount: 10, currency: 'USD', method: 'card' },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().code).toBe('VALIDATION_ERROR');
+    });
+
+    it('rejects an empty string Idempotency-Key header → 400', async () => {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/v1/payments',
+        headers: { ...authHeaders(), 'idempotency-key': '' },
+        payload: { amount: 10, currency: 'USD', method: 'card' },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().code).toBe('VALIDATION_ERROR');
+    });
+
+    it('auto-generates an idempotency key when none is provided → 201', async () => {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/v1/payments',
+        headers: authHeaders(),
+        payload: { amount: 10, currency: 'USD', method: 'card' },
+      });
+      expect(res.statusCode).toBe(201);
+      expect(res.json().data.id).toBeDefined();
+    });
+
+    it('rejects a non-UUID idempotency key in body → 400', async () => {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/v1/payments',
+        headers: authHeaders(),
+        payload: { amount: 10, currency: 'USD', method: 'card', idempotencyKey: 'not-a-uuid' },
+      });
+      expect(res.statusCode).toBe(400);
+    });
+
+    it('rejects an empty string idempotency key in body → 400', async () => {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/v1/payments',
+        headers: authHeaders(),
+        payload: { amount: 10, currency: 'USD', method: 'card', idempotencyKey: '' },
+      });
+      expect(res.statusCode).toBe(400);
+    });
+
+    it('returns the same result for a duplicate key with same amount/creator → 201, same id', async () => {
+      const first = await app.inject({
+        method: 'POST',
+        url: '/api/v1/payments',
+        headers: { ...authHeaders(), 'idempotency-key': VALID_UUID },
+        payload: { amount: 20, currency: 'USD', method: 'card' },
+      });
+      const second = await app.inject({
+        method: 'POST',
+        url: '/api/v1/payments',
+        headers: { ...authHeaders(), 'idempotency-key': VALID_UUID },
+        payload: { amount: 20, currency: 'USD', method: 'card' },
+      });
+
+      expect(first.statusCode).toBe(201);
+      expect(second.statusCode).toBe(201);
+      expect(second.json().data.id).toBe(first.json().data.id);
+      expect(prisma.payments).toHaveLength(1);
+    });
+
+    it('returns 409 DUPLICATE_PAYMENT for duplicate key with different amount', async () => {
+      await app.inject({
+        method: 'POST',
+        url: '/api/v1/payments',
+        headers: { ...authHeaders(), 'idempotency-key': VALID_UUID_2 },
+        payload: { amount: 10, currency: 'USD', method: 'card' },
+      });
+
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/v1/payments',
+        headers: { ...authHeaders(), 'idempotency-key': VALID_UUID_2 },
+        payload: { amount: 99, currency: 'USD', method: 'card' },
+      });
+
+      expect(res.statusCode).toBe(409);
+      expect(res.json().code).toBe('DUPLICATE_PAYMENT');
+    });
+
+    it('returns 409 DUPLICATE_PAYMENT for duplicate key with different creatorId', async () => {
+      const KEY = 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11';
+
+      await app.inject({
+        method: 'POST',
+        url: '/api/v1/payments',
+        headers: { ...authHeaders(), 'idempotency-key': KEY },
+        payload: { amount: 10, currency: 'USD', method: 'card', creatorId: 'c-1' },
+      });
+
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/v1/payments',
+        headers: { ...authHeaders(), 'idempotency-key': KEY },
+        payload: { amount: 10, currency: 'USD', method: 'card', creatorId: 'c-2' },
+      });
+
+      expect(res.statusCode).toBe(409);
+      expect(res.json().code).toBe('DUPLICATE_PAYMENT');
+    });
   });
 });

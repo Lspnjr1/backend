@@ -125,9 +125,22 @@ describe('production/staging guards', () => {
     const result = EnvSchema.safeParse({
       NODE_ENV: 'production',
       DATABASE_URL: 'postgres://u:p@h/db',
+      DB_SSL_MODE: 'verify-full',
       JWT_SECRET: 'a-very-strong-production-secret-0123456789',
     });
     expect(result.success).toBe(true);
+  });
+
+  it('requires certificate validation for production database connections', () => {
+    const result = EnvSchema.safeParse({
+      NODE_ENV: 'production',
+      DATABASE_URL: 'postgres://u:p@h/db',
+      JWT_SECRET: 'a-very-strong-production-secret-0123456789',
+      DB_SSL_MODE: 'require',
+    });
+    expect(result.success).toBe(false);
+    if (!result.success)
+      expect(formatConfigIssues(result.error).join(' ')).toContain('DB_SSL_MODE');
   });
 });
 
@@ -162,7 +175,12 @@ describe('config loader (issue #60)', () => {
     fs.writeFileSync(path.join(root, '.env.staging'), 'LOG_LEVEL=warn\nRATE_LIMIT_STORE=redis\n');
 
     const config = loadConfig({
-      env: { NODE_ENV: 'staging', DATABASE_URL: 'postgres://u:p@h/db', JWT_SECRET: 'x'.repeat(40) },
+      env: {
+        NODE_ENV: 'staging',
+        DATABASE_URL: 'postgres://u:p@h/db',
+        DB_SSL_MODE: 'verify-full',
+        JWT_SECRET: 'x'.repeat(40),
+      },
       projectRoot: root,
     });
 
@@ -203,9 +221,9 @@ describe('config loader (issue #60)', () => {
   it('fails fast with non-zero intent on invalid config (startup guard)', () => {
     // The boot path treats ConfigValidationError as fatal (src/index.ts loads
     // config at import time — the process exits before listen()).
-    expect(() =>
-      loadConfig({ ...base, env: { NODE_ENV: 'development', PORT: '70000' } })
-    ).toThrow(ConfigValidationError);
+    expect(() => loadConfig({ ...base, env: { NODE_ENV: 'development', PORT: '70000' } })).toThrow(
+      ConfigValidationError
+    );
   });
 
   it('aborts a real process boot with a non-zero exit code', async () => {
@@ -362,7 +380,9 @@ describe('config audit log', () => {
     expect(reloaded.LOG_LEVEL).toBe('warn');
 
     const reloads = getReloadAuditLog();
-    expect(reloads.some((r) => r.outcome === 'applied' && r.detail.includes('LOG_LEVEL'))).toBe(true);
+    expect(reloads.some((r) => r.outcome === 'applied' && r.detail.includes('LOG_LEVEL'))).toBe(
+      true
+    );
   });
 
   it('keeps the previous snapshot when a hot reload is invalid', () => {
@@ -381,10 +401,7 @@ describe('config audit log', () => {
 
 describe('documentation completeness', () => {
   it('documents every schema key in docs/CONFIGURATION.md', () => {
-    const docs = fs.readFileSync(
-      path.resolve(__dirname, '../../../docs/CONFIGURATION.md'),
-      'utf8'
-    );
+    const docs = fs.readFileSync(path.resolve(__dirname, '../../../docs/CONFIGURATION.md'), 'utf8');
 
     const keys = Object.keys(EnvSchemaObject.shape);
     const missing = keys.filter((key) => !docs.includes(`| \`${key}\``));
@@ -392,10 +409,7 @@ describe('documentation completeness', () => {
   });
 
   it('documents every variable in .env.example', () => {
-    const example = fs.readFileSync(
-      path.resolve(__dirname, '../../../.env.example'),
-      'utf8'
-    );
+    const example = fs.readFileSync(path.resolve(__dirname, '../../../.env.example'), 'utf8');
 
     const keys = Object.keys(EnvSchemaObject.shape);
     const missing = keys.filter((key) => !example.includes(`${key}=`));

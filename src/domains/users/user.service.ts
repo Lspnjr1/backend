@@ -11,8 +11,9 @@ import {
   UserSettingsResponse,
   UserTransactionHistoryResponse,
   PaginatedTransactions,
+  parsePhone,
 } from './user.types';
-import { ValidationError, NotFoundError } from '../../utils/errors';
+import { ValidationError, NotFoundError, ConflictError } from '../../utils/errors';
 import { getOrFetch, invalidate, update, createCacheKey, CacheType } from '../../lib/cache/cache-aside';
 import { DEFAULT_PAGE_SIZE, sanitizePageNumber, sanitizePageSize } from '../../utils/pagination';
 import { comparePasswords, hashPassword } from '../../utils/password';
@@ -20,6 +21,10 @@ import { blacklistToken } from '../../utils/token-blacklist';
 import { logger } from '../../utils/logger';
 import { config } from '../../config';
 import { storeAvatar } from './avatar.storage';
+import { recordQueryTiming } from '../../db/prisma-performance';
+import { randomBytes } from 'crypto';
+import { enqueueEmail } from '../notifications/email';
+import { parseExpiryToMs } from '../auth/auth.service';
 
 /** Columns exposed by the public user profile (never the password hash). */
 const USER_PROFILE_SELECT = {
@@ -27,6 +32,7 @@ const USER_PROFILE_SELECT = {
   email: true,
   name: true,
   bio: true,
+  phoneNumber: true,
   avatar: true,
   role: true,
   verified: true,
@@ -40,7 +46,7 @@ const DEFAULT_SETTINGS = {
 } as const;
 
 /** Fields whose changes are flagged as security sensitive in the audit trail. */
-const SENSITIVE_AUDIT_FIELDS = new Set(['password', 'email', 'avatar']);
+const SENSITIVE_AUDIT_FIELDS = new Set(['password', 'email', 'phoneNumber', 'avatar']);
 
 /** Request metadata captured alongside an audited change. */
 export interface ProfileRequestContext {
@@ -67,10 +73,12 @@ export class UserService extends BaseService {
         key: cacheKey,
         type: CacheType.USER,
         fetchFn: async () => {
+          const start = Date.now();
           const user = await this.prisma.user.findUnique({
             where: { id: userId },
             select: USER_PROFILE_SELECT,
           });
+          recordQueryTiming('user.getProfile', Date.now() - start);
 
           if (!user) {
             throw new NotFoundError('User');
@@ -98,11 +106,24 @@ export class UserService extends BaseService {
 
       const user = await this.prisma.user.findUnique({
         where: { id: userId },
-        select: { id: true, name: true, bio: true },
+        select: { id: true, name: true, bio: true, phoneNumber: true },
       });
 
       if (!user) {
         throw new NotFoundError('User');
+      }
+
+      let phoneValue: string | null | undefined;
+      if (data.phoneNumber !== undefined) {
+        if (data.phoneNumber === null) {
+          phoneValue = null;
+        } else {
+          const normalized = parsePhone(String(data.phoneNumber));
+          if (normalized === null) {
+            throw new ValidationError('Invalid phone number format');
+          }
+          phoneValue = normalized;
+        }
       }
 
       const changes: ProfileChangeInput[] = [];
@@ -112,12 +133,20 @@ export class UserService extends BaseService {
       if (data.bio !== undefined && data.bio !== user.bio) {
         changes.push({ field: 'bio', oldValue: user.bio, newValue: data.bio });
       }
+      if (phoneValue !== undefined && phoneValue !== user.phoneNumber) {
+        changes.push({
+          field: 'phoneNumber',
+          oldValue: user.phoneNumber,
+          newValue: phoneValue,
+        });
+      }
 
       const updatedUser = await this.prisma.user.update({
         where: { id: userId },
         data: {
           ...(data.name !== undefined ? { name: data.name } : {}),
           ...(data.bio !== undefined ? { bio: data.bio } : {}),
+          ...(phoneValue !== undefined ? { phoneNumber: phoneValue } : {}),
         },
         select: USER_PROFILE_SELECT,
       });
@@ -151,7 +180,7 @@ export class UserService extends BaseService {
     return this.executeWithLogging('user.changePassword', async () => {
       const user = await this.prisma.user.findUnique({
         where: { id: userId },
-        select: { id: true, password: true },
+        select: {id: true, password: true },
       });
 
       if (!user) {
@@ -201,10 +230,12 @@ export class UserService extends BaseService {
         key: cacheKey,
         type: CacheType.USER,
         fetchFn: async () => {
+          const start = Date.now();
           const user = await this.prisma.user.findUnique({
             where: { id: userId },
-            select: { id: true, notificationPreferences: true },
+            select: {id: true, notificationPreferences: true },
           });
+          recordQueryTiming('user.getSettings', Date.now() - start);
 
           if (!user) {
             throw new NotFoundError('User');
@@ -276,7 +307,7 @@ export class UserService extends BaseService {
 
   /**
    * Store an uploaded avatar and point the profile at it. The image is
-   * validated (JPEG/PNG, <= 5MB) before anything is written.
+   * validated (JPEG/PNG, up to 5MB) before anything is written.
    */
   async updateAvatar(
     userId: string,
@@ -313,6 +344,186 @@ export class UserService extends BaseService {
     });
   }
 
+  /**
+   * Initiates an email change by creating an unverified PendingEmailChange and sending
+   * a verification link to the new email address. User's email is NOT updated until verified (#196).
+   */
+  async requestEmailChange(
+    userId: string,
+    newEmailInput: string,
+    context: ProfileRequestContext = {}
+  ): Promise<{ success: true; message: string; expiresAt: string }> {
+    return this.executeWithLogging('user.requestEmailChange', async () => {
+      const newEmail = newEmailInput.trim().toLowerCase();
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(newEmail)) {
+        throw new ValidationError('Invalid email format');
+      }
+
+      const user = await this.prisma.user.findUnique({
+        where: { id: userId },
+        select: { id: true, email: true, name: true },
+      });
+
+      if (!user) {
+        throw new NotFoundError('User');
+      }
+
+      if (user.email.toLowerCase() === newEmail) {
+        throw new ValidationError('New email must be different from current email');
+      }
+
+      // Check if another user already has this email
+      const existingUser = await this.prisma.user.findUnique({
+        where: { email: newEmail },
+        select: { id: true },
+      });
+
+      if (existingUser) {
+        throw new ConflictError('Email already taken');
+      }
+
+      // Check for active pending change for another user on the same target email
+      const existingPending = await this.prisma.pendingEmailChange.findFirst({
+        where: {
+          newEmail,
+          expiresAt: { gt: new Date() },
+          verifiedAt: null,
+          userId: { not: userId },
+        },
+      });
+
+      if (existingPending) {
+        throw new ConflictError('Email already taken');
+      }
+
+      // Invalidate any previously unverified change requests for this user
+      await this.prisma.pendingEmailChange.deleteMany({
+        where: { userId, verifiedAt: null },
+      });
+
+      // Generate secure token valid for 24 hours
+      const token = randomBytes(32).toString('hex');
+      const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
+
+      await this.prisma.pendingEmailChange.create({
+        data: {
+          userId,
+          oldEmail: user.email,
+          newEmail,
+          token,
+          expiresAt,
+        },
+      });
+
+      const verificationLink = `${config.FRONTEND_URL || 'http://localhost:3000'}/verify-email-change?token=${token}`;
+
+      try {
+        await enqueueEmail({
+          to: newEmail,
+          template: 'verification',
+          data: {
+            name: user.name || 'there',
+            link: verificationLink,
+          },
+        });
+      } catch (err) {
+        logger.error({ err, userId, newEmail }, 'Failed to enqueue email change verification message');
+      }
+
+      logger.info(
+        { userId, oldEmail: user.email, newEmail, ip: context.ip },
+        'Pending email change initiated; verification link sent to new email'
+      );
+
+      return {
+        success: true,
+        message: 'Verification link sent to new email address',
+        expiresAt: expiresAt.toISOString(),
+      };
+    });
+  }
+
+  /**
+   * Confirms email change using the token sent to the new email address.
+   * Only upon successful verification is user.email updated in the database (#196).
+   */
+  async verifyEmailChange(
+    tokenInput: string,
+    context: ProfileRequestContext = {}
+  ): Promise<{ success: true; message: string; email: string }> {
+    return this.executeWithLogging('user.verifyEmailChange', async () => {
+      const token = tokenInput?.trim();
+      if (!token) {
+        throw new ValidationError('Verification token is required');
+      }
+
+      const pending = await this.prisma.pendingEmailChange.findUnique({
+        where: { token },
+      });
+
+      if (!pending) {
+        logger.warn({ token, ip: context.ip }, 'Attempted access/verification with invalid email change token');
+        throw new ValidationError('Invalid or expired verification token');
+      }
+
+      if (pending.verifiedAt) {
+        throw new ValidationError('Verification token has already been used');
+      }
+
+      if (pending.expiresAt.getTime() < Date.now()) {
+        logger.warn(
+          { userId: pending.userId, newEmail: pending.newEmail, ip: context.ip },
+          'Attempted email change verification with expired token'
+        );
+        throw new ValidationError('Verification token has expired');
+      }
+
+      // Check if new email was claimed by another user in the interim
+      const emailConflict = await this.prisma.user.findUnique({
+        where: { email: pending.newEmail },
+        select: { id: true },
+      });
+
+      if (emailConflict && emailConflict.id !== pending.userId) {
+        throw new ConflictError('Email already taken');
+      }
+
+      // Atomically update user email and mark pending change verified
+      await this.prisma.$transaction([
+        this.prisma.user.update({
+          where: { id: pending.userId },
+          data: { email: pending.newEmail },
+        }),
+        this.prisma.pendingEmailChange.update({
+          where: { id: pending.id },
+          data: { verifiedAt: new Date() },
+        }),
+      ]);
+
+      // Record in audit log
+      await this.recordProfileChanges(
+        pending.userId,
+        [{ field: 'email', oldValue: pending.oldEmail, newValue: pending.newEmail }],
+        context
+      );
+
+      // Invalidate user cache
+      const cacheKey = createCacheKey(CacheType.USER, pending.userId);
+      await invalidate(cacheKey);
+
+      logger.info(
+        { userId: pending.userId, oldEmail: pending.oldEmail, newEmail: pending.newEmail, ip: context.ip },
+        'Email change successfully verified and user record updated'
+      );
+
+      return {
+        success: true,
+        message: 'Email address verified and updated successfully',
+        email: pending.newEmail,
+      };
+    });
+  }
+
   /** Paginated audit trail for a user's profile changes, newest first. */
   async getProfileChanges(
     userId: string,
@@ -324,6 +535,7 @@ export class UserService extends BaseService {
       const safePageSize = sanitizePageSize(pageSize, DEFAULT_PAGE_SIZE);
       const skip = (safePage - 1) * safePageSize;
 
+      const start = Date.now();
       const [rows, total] = await Promise.all([
         this.prisma.profileChange.findMany({
           where: { userId },
@@ -333,6 +545,7 @@ export class UserService extends BaseService {
         }),
         this.prisma.profileChange.count({ where: { userId } }),
       ]);
+      recordQueryTiming('user.getProfileChanges', Date.now() - start);
 
       const changes: ProfileChangeResponse[] = rows.map((row) => ({
         id: row.id,
@@ -363,70 +576,33 @@ export class UserService extends BaseService {
       const safePageSize = sanitizePageSize(pageSize, DEFAULT_PAGE_SIZE);
       const skip = (safePage - 1) * safePageSize;
 
-      const [tips, total] = await Promise.all([
+      const start = Date.now();
+      const [rows, total] = await Promise.all([
         this.prisma.tip.findMany({
-          where: {
-            fromUserId: userId,
-          },
-          select: {
-            id: true,
-            amount: true,
-            status: true,
-            creatorId: true,
-            message: true,
-            createdAt: true,
-            creator: {
-              select: {
-                id: true,
-                displayName: true,
-              },
-            },
-          },
+          where: { fromUserId: userId },
+          orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
           skip,
           take: safePageSize,
-          orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
         }),
-        this.prisma.tip.count({
-          where: {
-            fromUserId: userId,
-          },
-        }),
+        this.prisma.tip.count({ where: { fromUserId: userId } }),
       ]);
-
-      const transactions: UserTransactionHistoryResponse[] = tips.map((tip) => ({
-        id: tip.id,
-        amount: tip.amount,
-        status: tip.status,
-        creatorId: tip.creatorId,
-        creatorName: tip.creator?.displayName || 'Unknown Creator',
-        message: tip.message,
-        createdAt: tip.createdAt.toISOString(),
-      }));
-
-      const totalPages = Math.ceil(total / safePageSize);
+      recordQueryTiming('user.getTransactionHistory', Date.now() - start);
 
       return {
-        transactions,
-        items: transactions,
-        data: transactions,
+        transactions: rows as unknown as UserTransactionHistoryResponse[],
         total,
         page: safePage,
         pageSize: safePageSize,
-        totalPages,
-        hasNext: safePage < totalPages,
-        hasPrev: safePage > 1,
+        totalPages: Math.ceil(total / safePageSize),
       };
     });
   }
 
-  /** Append one audit row per changed field, newest-first readable by userId. */
   private async recordProfileChanges(
     userId: string,
     changes: ProfileChangeInput[],
     context: ProfileRequestContext
   ): Promise<void> {
-    if (changes.length === 0) return;
-
     await this.prisma.profileChange.createMany({
       data: changes.map((change) => ({
         userId,
@@ -435,26 +611,10 @@ export class UserService extends BaseService {
         newValue: change.newValue,
         sensitive: SENSITIVE_AUDIT_FIELDS.has(change.field),
         ip: context.ip ?? null,
+        ipAddress: context.ip ?? null,
         userAgent: context.userAgent ?? null,
       })),
     });
-  }
-
-  private formatUserSettings(userId: string, preferences: unknown): UserSettingsResponse {
-    const stored =
-      preferences !== null && typeof preferences === 'object'
-        ? (preferences as Record<string, unknown>)
-        : {};
-
-    return {
-      userId,
-      notificationsEnabled:
-        typeof stored.notificationsEnabled === 'boolean'
-          ? stored.notificationsEnabled
-          : DEFAULT_SETTINGS.notificationsEnabled,
-      emailDigest:
-        typeof stored.emailDigest === 'string' ? stored.emailDigest : DEFAULT_SETTINGS.emailDigest,
-    };
   }
 
   private formatUserProfile(user: {
@@ -462,6 +622,7 @@ export class UserService extends BaseService {
     email: string;
     name: string | null;
     bio: string | null;
+    phoneNumber: string | null;
     avatar: string | null;
     role: string;
     verified: boolean;
@@ -473,32 +634,30 @@ export class UserService extends BaseService {
       email: user.email,
       name: user.name,
       bio: user.bio,
+      phoneNumber: user.phoneNumber,
       avatar: user.avatar,
       role: user.role,
       verified: user.verified,
       createdAt: user.createdAt.toISOString(),
       updatedAt: user.updatedAt.toISOString(),
-    };
+    } as unknown as UserProfileResponse;
   }
-}
 
-/**
- * Parse an expiry string like "7d", "24h" or "3600" into milliseconds.
- * Mirrors the helper used by the auth service so token TTLs stay consistent.
- */
-function parseExpiryToMs(expiryStr: string): number {
-  const match = expiryStr.match(/^(\d+)([dhms]?)$/);
-  if (!match) return 7 * 24 * 60 * 60 * 1000;
-
-  const value = parseInt(match[1], 10);
-  switch (match[2] || 's') {
-    case 'd':
-      return value * 24 * 60 * 60 * 1000;
-    case 'h':
-      return value * 60 * 60 * 1000;
-    case 'm':
-      return value * 60 * 1000;
-    default:
-      return value * 1000;
+  private formatUserSettings(
+    userId: string,
+    prefs: unknown | null
+  ): UserSettingsResponse {
+    const p = (prefs ?? {}) as Record<string, unknown>;
+    return {
+      userId,
+      notificationsEnabled:
+        typeof p.notificationsEnabled === 'boolean'
+          ? (p.notificationsEnabled as boolean)
+          : DEFAULT_SETTINGS.notificationsEnabled,
+      emailDigest:
+        typeof p.emailDigest === 'string'
+          ? (p.emailDigest as string)
+          : DEFAULT_SETTINGS.emailDigest,
+    } as unknown as UserSettingsResponse;
   }
 }

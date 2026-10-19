@@ -1,8 +1,9 @@
-import { PrismaClient } from '@prisma/client';
+import { Prisma, PrismaClient } from '@prisma/client';
 import { BaseService } from '../../services/base.service';
 import { CreateCreatorRequest, UpdateCreatorRequest } from './creator.types';
-import { ValidationError } from '../../utils/errors';
+import { ConflictError, ValidationError } from '../../utils/errors';
 import { getOrFetch, update, createCacheKey, CacheType } from '../../lib/cache/cache-aside';
+import { invalidateCaches, creatorCacheKeys } from '../../lib/cache/invalidation';
 import {
   DEFAULT_PAGE_SIZE,
   sanitizePageNumber,
@@ -53,7 +54,7 @@ export class CreatorService extends BaseService {
       });
 
       if (existingCreator) {
-        throw new ValidationError('Username already taken');
+        throw new ConflictError('Creator name already taken');
       }
 
       const user = await this.prisma.user.findUnique({
@@ -65,14 +66,26 @@ export class CreatorService extends BaseService {
         throw new ValidationError('User not found');
       }
 
-      const creator = await this.prisma.creator.create({
-        data: {
-          userId,
-          username: data.username,
-          displayName: data.displayName,
-          bio: data.bio,
-        },
-      });
+      let creator;
+      try {
+        creator = await this.prisma.creator.create({
+          data: {
+            userId,
+            username: data.username,
+            displayName: data.displayName,
+            bio: data.bio,
+          },
+        });
+      } catch (error: any) {
+        if (
+          error?.code === 'P2002' ||
+          (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') ||
+          error?.message?.includes('Unique constraint failed')
+        ) {
+          throw new ConflictError('Creator name already taken');
+        }
+        throw error;
+      }
 
       // Update user role to creator
       await this.prisma.user.update({
@@ -151,6 +164,7 @@ export class CreatorService extends BaseService {
         const usernameCacheKey = createCacheKey(CacheType.CREATOR, `username:${creator.username}`);
         await update(usernameCacheKey, creator, CacheType.CREATOR);
       }
+      await invalidateCaches(creatorCacheKeys(creatorId, creator.username), 'creator.updated');
 
       return creator;
     });
