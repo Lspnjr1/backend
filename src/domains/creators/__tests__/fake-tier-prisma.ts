@@ -20,11 +20,13 @@ export class FakeTierPrisma {
     return `${prefix}_${this.seq}`;
   }
 
-  seedCreator(overrides: Partial<{ id: string; userId: string; username: string }> = {}): any {
+  seedCreator(overrides: Record<string, any> = {}): any {
     const creator = {
       id: overrides.id ?? this.nextId('creator'),
       userId: overrides.userId ?? 'user_1',
       username: overrides.username ?? 'stellar-fan',
+      totalEarnings: 0,
+      ...overrides,
     };
     this.creators.push(creator);
     return creator;

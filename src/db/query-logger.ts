@@ -1,5 +1,5 @@
 import { logger } from '../utils/logger';
-import { getRequestId } from '../utils/request-context';
+import { getRequestId } from '../lib/requestContext';
 
 export interface QueryLogOptions {
   slowQueryThresholdMs?: number;

@@ -36,6 +36,8 @@ const tipFilterOptions = (query: TipHistoryQueryInput) => ({
   status: query.status,
   minDate: query.minDate,
   maxDate: query.maxDate,
+  // IANA timezone for minDate/maxDate and response timestamps (issue #216).
+  timezone: query.timezone,
   minAmount: query.minAmount,
   maxAmount: query.maxAmount,
   query: query.query,
@@ -43,6 +45,42 @@ const tipFilterOptions = (query: TipHistoryQueryInput) => ({
   creatorId: query.creatorId,
 });
 
+/**
+ * Media attached to a tip message (#64), in attachment order.
+ *
+ * This has to be spelled out: the 201 schema below is a fast-json-stringify
+ * schema, so any property it does not declare is stripped from the response and
+ * the client would never see the media it just attached.
+ */
+const tipMediaResponseSchema = {
+  type: 'array',
+  items: {
+    type: 'object',
+    properties: {
+      id: { type: 'string' },
+      kind: { type: 'string' },
+      status: { type: 'string' },
+      mimeType: { type: 'string' },
+      fileName: { type: 'string' },
+      sizeBytes: { type: 'number' },
+      width: { type: ['number', 'null'] },
+      height: { type: ['number', 'null'] },
+      durationSeconds: { type: ['number', 'null'] },
+      url: { type: 'string' },
+      previewUrl: { type: ['string', 'null'] },
+      thumbnailUrl: { type: ['string', 'null'] },
+      processing: {
+        type: 'object',
+        properties: {
+          status: { type: 'string' },
+          error: { type: ['string', 'null'] },
+        },
+      },
+      createdAt: { type: 'string' },
+      attachedTipId: { type: ['string', 'null'] },
+    },
+  },
+} as const;
 export const registerPaymentRoutes = (app: FastifyInstance, prisma: PrismaClient): void => {
   const paymentService = new PaymentService(prisma);
 
@@ -51,6 +89,16 @@ export const registerPaymentRoutes = (app: FastifyInstance, prisma: PrismaClient
    * Create a new tip (initial step before payment transaction)
    * Requires: authenticated user with verified wallet
    * Rate limited: 10 tips per hour
+   *
+   * Asynchronous (#221): the tip is created and returned immediately with
+   * `status: "pending"` and a `jobId` for the queued balance-verification
+   * job; the on-chain wallet balance check that used to block this request
+   * now happens afterwards, in the background, so Stellar network congestion
+   * can no longer time out tip creation. Poll
+   * `GET /api/v1/transactions/:id` for status updates (the tip moves to
+   * `failed` if the background check finds insufficient funds), and
+   * registered webhooks still fire `payment.completed` once a submitted
+   * transaction is confirmed.
    */
   app.post<{ Body: CreateTipInput }>(
     '/api/v1/transactions/tip',
@@ -71,6 +119,11 @@ export const registerPaymentRoutes = (app: FastifyInstance, prisma: PrismaClient
                   amount: { type: 'number' },
                   status: { type: 'string' },
                   createdAt: { type: 'string' },
+                  media: tipMediaResponseSchema,
+                  // #221 — async creation: the balance-verification job id so
+                  // a client can correlate/poll it (though the primary polling
+                  // surface is GET /api/v1/transactions/:id for tip status).
+                  jobId: { type: 'string' },
                 },
               },
             },
@@ -251,7 +304,9 @@ export const registerPaymentRoutes = (app: FastifyInstance, prisma: PrismaClient
    * POST /api/v1/transactions/:id/build
    * Build a Stellar payment transaction for frontend signing
    * Requires: authenticated user
-   * Body: { senderPublicKey, creatorPublicKey, amount, assetCode?, assetIssuer? }
+   * Body: { senderPublicKey, creatorPublicKey, amount, assetCode?, assetIssuer?, memo? }
+   * An optional memo is limited to 28 UTF-8 bytes and rejected with a 400
+   * field error before the transaction is built (#180).
    */
   app.post<{ Params: { id: string }; Body: BuildPaymentTransactionInput }>(
     '/api/v1/transactions/:id/build',
@@ -271,7 +326,8 @@ export const registerPaymentRoutes = (app: FastifyInstance, prisma: PrismaClient
         throw new UnauthorizedError('Authentication required');
       }
 
-      const { senderPublicKey, creatorPublicKey, amount, assetCode, assetIssuer } = request.body;
+      const { senderPublicKey, creatorPublicKey, amount, assetCode, assetIssuer, memo } =
+        request.body;
 
       const result = await paymentService.buildPaymentTransaction(
         request.params.id,
@@ -279,7 +335,8 @@ export const registerPaymentRoutes = (app: FastifyInstance, prisma: PrismaClient
         creatorPublicKey,
         amount,
         assetCode,
-        assetIssuer || process.env.USDC_ISSUER
+        assetIssuer || process.env.USDC_ISSUER,
+        memo
       );
 
       reply.code(200).send(formatSuccess(result));

@@ -1,7 +1,8 @@
+import { generateCsrfToken } from '../../middleware/csrf';
 import { Prisma, PrismaClient } from '@prisma/client';
 import { BaseService } from '../../services/base.service';
 import { LoginRequest, PasswordResetConfirmRequestSchema, RegisterRequest } from './auth.types';
-import { TooManyRequestsError, ValidationError } from '../../utils/errors';
+import { ConflictError, TooManyRequestsError, ValidationError } from '../../utils/errors';
 import { generateAccessToken, generateRefreshToken } from '../../utils/jwt';
 import { hashPassword, comparePasswords } from '../../utils/password';
 import { blacklistRefreshToken } from '../../utils/token-blacklist';
@@ -9,6 +10,7 @@ import { config } from '../../config';
 import { logger } from '../../utils/logger';
 import { createHash, randomBytes, randomUUID } from 'crypto';
 import { enqueueEmail } from '../../domains/notifications/email';
+import { SessionService } from './session.service';
 
 const PASSWORD_RESET_TTL_MS = 60 * 60 * 1000;
 const PASSWORD_RESET_LIMIT = 3;
@@ -29,19 +31,31 @@ export class AuthService extends BaseService {
       });
 
       if (existingUser) {
-        throw new ValidationError('Email already registered');
+        throw new ConflictError('Email already taken');
       }
 
       const hashedPassword = await hashPassword(data.password);
 
-      const user = await this.prisma.user.create({
-        data: {
-          email: data.email,
-          password: hashedPassword,
-          name: data.name,
-          role: 'fan',
-        },
-      });
+      let user;
+      try {
+        user = await this.prisma.user.create({
+          data: {
+            email: data.email,
+            password: hashedPassword,
+            name: data.name,
+            role: 'fan',
+          },
+        });
+      } catch (error: any) {
+        if (
+          error?.code === 'P2002' ||
+          (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') ||
+          error?.message?.includes('Unique constraint failed')
+        ) {
+          throw new ConflictError('Email already taken');
+        }
+        throw error;
+      }
 
       // Send verification email
       await this.sendVerificationEmail(user.id, user.email, user.name);
@@ -117,6 +131,17 @@ export class AuthService extends BaseService {
               where: { email: { equals: email, mode: 'insensitive' } },
               select: { id: true, email: true, name: true },
             });
+            if (!user) {
+              const unverified = await (tx as any).pendingEmailChange?.findFirst({
+                where: { newEmail: email, verifiedAt: null },
+              });
+              if (unverified) {
+                logger.warn(
+                  { emailFingerprint: emailFingerprint(email), userId: unverified.userId },
+                  'Flagged attempted password reset to account with unverified email'
+                );
+              }
+            }
             await tx.passwordResetToken.create({
               data: {
                 email,
@@ -145,19 +170,21 @@ export class AuthService extends BaseService {
         throw new TooManyRequestsError('Too many password reset requests. Try again later.');
       }
 
+      const successfulResetRequest = result as Extract<typeof result, { rateLimited: false }>;
+
       logger.info(
-        { emailFingerprint: emailFingerprint(email), accountExists: Boolean(result.user), outcome: 'requested' },
+        { emailFingerprint: emailFingerprint(email), accountExists: Boolean(successfulResetRequest.user), outcome: 'requested' },
         'Password reset request'
       );
 
-      if (result.user) {
+      if (successfulResetRequest.user) {
         const link = `${config.FRONTEND_URL || 'http://localhost:3000'}/reset-password?token=${rawToken}`;
         try {
           await enqueueEmail({
-            to: result.user.email,
+            to: successfulResetRequest.user.email,
             template: 'password-reset',
-            data: { name: result.user.name || 'there', link },
-            userId: result.user.id,
+            data: { name: successfulResetRequest.user.name || 'there', link },
+            userId: successfulResetRequest.user.id,
           });
         } catch (error) {
           logger.error({ emailFingerprint: emailFingerprint(email), error }, 'Failed to queue password reset email');
@@ -277,10 +304,11 @@ export class AuthService extends BaseService {
     });
   }
 
-  async login(data: LoginRequest): Promise<{
+  async login(data: LoginRequest, metadata: { ipAddress?: string; userAgent?: string; device?: string } = {}): Promise<{
     user: { id: string; email: string; name: string | null; role: string };
     accessToken: string;
     refreshToken: string;
+    csrfToken: string;
   }> {
     return this.executeWithLogging('user.login', async () => {
       const user = await this.prisma.user.findUnique({
@@ -288,15 +316,48 @@ export class AuthService extends BaseService {
       });
 
       if (!user) {
+        const unverifiedPending = await (this.prisma as any).pendingEmailChange?.findFirst({
+          where: { newEmail: data.email, verifiedAt: null },
+        });
+        if (unverifiedPending) {
+          logger.warn(
+            { email: data.email, userId: unverifiedPending.userId, ipAddress: metadata.ipAddress },
+            'Flagged attempted access to account with unverified email'
+          );
+        }
+        await (this.prisma as any).authAttempt?.create({
+          data: {
+            email: data.email,
+            ipAddress: metadata.ipAddress ?? 'unknown',
+            action: 'login',
+            reason: unverifiedPending ? 'unverified_pending_email' : 'unknown_user',
+          },
+        });
         throw new ValidationError('Invalid email or password');
+      }
+
+      if (user.lockedUntil && user.lockedUntil > new Date()) {
+        await (this.prisma as any).authAttempt?.create({ data: { email: data.email, ipAddress: metadata.ipAddress ?? 'unknown', action: 'login', reason: 'locked' } });
+        throw new TooManyRequestsError('Account temporarily locked. Check your email or try again later.');
       }
 
       const isPasswordValid = await comparePasswords(data.password, user.password);
       if (!isPasswordValid) {
+        const attempts = user.failedLoginAttempts + 1;
+        const lockedUntil = attempts >= 5 ? new Date(Date.now() + 15 * 60 * 1000) : null;
+        await (this.prisma as any).user.update?.({ where: { id: user.id }, data: { failedLoginAttempts: lockedUntil ? 0 : attempts, lockedUntil } });
+        await (this.prisma as any).authAttempt?.create({ data: { email: data.email, ipAddress: metadata.ipAddress ?? 'unknown', action: 'login', reason: 'invalid_password' } });
+        if (lockedUntil) {
+          try { await enqueueEmail({ to: user.email, template: 'account-locked', data: { name: user.name || 'there', unlockAt: lockedUntil.toISOString() }, userId: user.id }); } catch (error) { logger.warn({ error }, 'Unable to queue account lockout notification'); }
+        }
         throw new ValidationError('Invalid email or password');
       }
 
+      await (this.prisma as any).user.update?.({ where: { id: user.id }, data: { failedLoginAttempts: 0, lockedUntil: null } });
+      await (this.prisma as any).authAttempt?.create({ data: { email: data.email, ipAddress: metadata.ipAddress ?? 'unknown', action: 'login', success: true } });
+
       const jti = randomUUID();
+      const csrfToken = generateCsrfToken();
       
       const accessToken = generateAccessToken({
         userId: user.id,
@@ -304,9 +365,12 @@ export class AuthService extends BaseService {
         role: user.role,
         jti,
         authVersion: user.authVersion,
+        csrf: csrfToken,
       });
 
       const refreshToken = generateRefreshToken(user.id, jti, user.authVersion);
+
+      if ((this.prisma as any).session) await new SessionService(this.prisma).create(user.id, metadata);
 
       // Store refresh token expiry in blacklist for rotation
       const refreshExpiryMs = parseExpiryToMs(config.JWT_REFRESH_EXPIRES_IN);
@@ -317,6 +381,7 @@ export class AuthService extends BaseService {
         user: { id: user.id, email: user.email, name: user.name, role: user.role },
         accessToken,
         refreshToken,
+        csrfToken,
       };
     });
   }
@@ -324,6 +389,7 @@ export class AuthService extends BaseService {
   async refreshAccessToken(refreshToken: string): Promise<{
     accessToken: string;
     refreshToken: string;
+    csrfToken: string;
   }> {
     return this.executeWithLogging('user.refreshToken', async () => {
       const { verifyRefreshToken } = await import('../../utils/jwt');
@@ -356,12 +422,14 @@ export class AuthService extends BaseService {
 
       // Issue new tokens with new JTI
       const newJti = randomUUID();
+      const csrfToken = generateCsrfToken();
       const newAccessToken = generateAccessToken({
         userId: user.id,
         email: user.email,
         role: user.role,
         jti: newJti,
         authVersion: user.authVersion,
+        csrf: csrfToken,
       });
 
       const newRefreshToken = generateRefreshToken(user.id, newJti, user.authVersion);
@@ -375,6 +443,7 @@ export class AuthService extends BaseService {
       return {
         accessToken: newAccessToken,
         refreshToken: newRefreshToken,
+        csrfToken,
       };
     });
   }
@@ -405,7 +474,7 @@ export class AuthService extends BaseService {
 /**
  * Parse expiry string like "7d", "24h", "3600" to milliseconds
  */
-function parseExpiryToMs(expiryStr: string): number {
+export function parseExpiryToMs(expiryStr: string): number {
   const match = expiryStr.match(/^(\d+)([dhms]?)$/);
   if (!match) return 7 * 24 * 60 * 60 * 1000; // Default 7 days
 

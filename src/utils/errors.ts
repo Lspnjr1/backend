@@ -33,6 +33,12 @@ export const ErrorCodes = {
   DATABASE_UNAVAILABLE: 'DATABASE_UNAVAILABLE',
   EXTERNAL_SERVICE_ERROR: 'EXTERNAL_SERVICE_ERROR',
   SERVICE_UNAVAILABLE: 'SERVICE_UNAVAILABLE',
+  INSUFFICIENT_FUNDS: 'INSUFFICIENT_FUNDS',
+  INVALID_CURRENCY: 'INVALID_CURRENCY',
+  PAYMENT_DECLINED: 'PAYMENT_DECLINED',
+  DUPLICATE_PAYMENT: 'DUPLICATE_PAYMENT',
+  PAYMENT_NOT_FOUND: 'PAYMENT_NOT_FOUND',
+  PAYMENT_REQUIRED: 'PAYMENT_REQUIRED',
 } as const;
 
 export type ErrorCode = (typeof ErrorCodes)[keyof typeof ErrorCodes];
@@ -130,6 +136,42 @@ export const ERROR_CATALOG: Record<string, ErrorDefinition> = {
     statusCode: 503,
     code: ErrorCodes.SERVICE_UNAVAILABLE,
     message: 'The service is temporarily unavailable',
+    expose: true,
+  },
+  [ErrorCodes.INSUFFICIENT_FUNDS]: {
+    statusCode: 422,
+    code: 'INSUFFICIENT_FUNDS',
+    message: 'Insufficient funds to complete the payment',
+    expose: true,
+  },
+  [ErrorCodes.INVALID_CURRENCY]: {
+    statusCode: 422,
+    code: 'INVALID_CURRENCY',
+    message: 'The specified currency is not supported',
+    expose: true,
+  },
+  [ErrorCodes.PAYMENT_DECLINED]: {
+    statusCode: 422,
+    code: 'PAYMENT_DECLINED',
+    message: 'The payment was declined',
+    expose: true,
+  },
+  [ErrorCodes.DUPLICATE_PAYMENT]: {
+    statusCode: 409,
+    code: 'DUPLICATE_PAYMENT',
+    message: 'A payment with this reference already exists',
+    expose: true,
+  },
+  [ErrorCodes.PAYMENT_NOT_FOUND]: {
+    statusCode: 404,
+    code: 'PAYMENT_NOT_FOUND',
+    message: 'The requested payment was not found',
+    expose: true,
+  },
+  [ErrorCodes.PAYMENT_REQUIRED]: {
+    statusCode: 402,
+    code: 'PAYMENT_REQUIRED',
+    message: 'Insufficient funds to complete the payment',
     expose: true,
   },
 };
@@ -268,6 +310,54 @@ export class ServiceUnavailableError extends AppError {
   constructor(message = 'The service is temporarily unavailable', details?: ErrorDetails) {
     super(503, ErrorCodes.SERVICE_UNAVAILABLE, message, { details });
     this.name = 'ServiceUnavailableError';
+  }
+}
+
+export class InsufficientFundsError extends AppError {
+  constructor(message = 'Insufficient funds to complete the payment', details?: ErrorDetails) {
+    super(422, ErrorCodes.INSUFFICIENT_FUNDS, message, { details });
+    this.name = 'InsufficientFundsError';
+  }
+}
+
+export class InvalidCurrencyError extends AppError {
+  constructor(currency: string, details?: ErrorDetails) {
+    super(422, ErrorCodes.INVALID_CURRENCY, `Currency '${currency}' is not supported`, { details });
+    this.name = 'InvalidCurrencyError';
+  }
+}
+
+export class PaymentDeclinedError extends AppError {
+  constructor(message = 'The payment was declined', details?: ErrorDetails) {
+    super(422, ErrorCodes.PAYMENT_DECLINED, message, { details });
+    this.name = 'PaymentDeclinedError';
+  }
+}
+
+export class DuplicatePaymentError extends AppError {
+  constructor(message = 'A payment with this reference already exists', details?: ErrorDetails) {
+    super(409, ErrorCodes.DUPLICATE_PAYMENT, message, { details });
+    this.name = 'DuplicatePaymentError';
+  }
+}
+
+export class PaymentNotFoundError extends AppError {
+  constructor(message = 'The requested payment was not found', details?: ErrorDetails) {
+    super(404, ErrorCodes.PAYMENT_NOT_FOUND, message, { details });
+    this.name = 'PaymentNotFoundError';
+  }
+}
+
+export interface PaymentRequiredDetails extends ErrorDetails {
+  requiredAmount: number;
+  currentBalance: number;
+  currency: string;
+}
+
+export class PaymentRequiredError extends AppError {
+  constructor(message = 'Insufficient funds to complete the payment', details?: PaymentRequiredDetails) {
+    super(402, ErrorCodes.PAYMENT_REQUIRED, message, { details });
+    this.name = 'PaymentRequiredError';
   }
 }
 

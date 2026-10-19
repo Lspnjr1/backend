@@ -1,22 +1,7 @@
-/**
- * Application entry point.
- *
- * Boot order matters:
- *   1. Config (src/config) — validated at import time; invalid config aborts
- *      the process before anything else happens (issue #60).
- *   2. Config warnings (unsafe-but-valid settings) are logged as one block.
- *   3. Rate limiting is registered first (its onRoute hook classifies every
- *      route, so it must exist before any route is added — issue #1).
- *   4. Security plugins (helmet + CORS + preflight limiter — issue #28).
- *   5. Routes, GraphQL, metrics.
- *   6. Graceful shutdown (issue #23): flip readiness, drain, close in order.
- */
-import Fastify from 'fastify';
+import Fastify, { type FastifyInstance } from 'fastify';
 import { randomUUID } from 'node:crypto';
-import cors from '@fastify/cors';
 import compress from '@fastify/compress';
-import swagger from '@fastify/swagger';
-import swaggerUi from '@fastify/swagger-ui';
+import cookie from '@fastify/cookie';
 import { config } from './config/env';
 import { applyJsonSerializer } from './config/serialization';
 import { setServiceState } from './services/health.service';
@@ -27,25 +12,41 @@ import {
   getPoolMetrics,
   getCircuitBreaker,
 } from './db';
-import { createInstrumentedPrismaClient, getPrismaPerformanceMonitor } from './db/prisma-performance';
+import {
+  createInstrumentedPrismaClient,
+  getPrismaPerformanceMonitor,
+} from './db/prisma-performance';
 import { getCircuitBreakerSnapshots as getExternalBreakerSnapshots } from './lib/circuit-breaker';
 import { registerAuthRoutes } from './domains/auth/auth.routes';
+import { registerTwoFactorRoutes } from './domains/auth/two-factor.routes';
 import { registerWalletRoutes } from './domains/auth/wallet.routes';
 import { registerPaymentRoutes } from './domains/payments/payment.routes';
 import { registerChargeRoutes } from './domains/payments/charge.routes';
 import { registerUserRoutes } from './domains/users/user.routes';
+import { registerAuditLogRoutes } from './domains/users/audit.routes';
 import { registerCreatorPayoutRoutes } from './domains/creators/payout.routes';
+import { registerCreatorTierRoutes } from './domains/creators/tier.routes';
 import { registerTeamRoutes } from './domains/teams/team.routes';
 import { registerWebhookRoutes } from './domains/webhooks/webhook.routes';
+import { registerDeveloperKeyRoutes } from './domains/developers/api-key.routes';
+import { initApiKeyAuth } from './domains/developers/api-key-auth';
+import { registerIncomingWebhookRoutes } from './domains/webhooks/webhook-incoming.routes';
 import { registerAnalyticsRoutes } from './domains/analytics/analytics.routes';
 import { registerAdminRoutes } from './domains/admin/admin.routes';
+import { registerMediaRoutes } from './domains/media/media.routes';
+import { registerModerationRoutes } from './domains/moderation/moderation.routes';
 import { registerRoleRoutes } from './domains/roles/role.routes';
 import { registerNotificationRoutes } from './domains/notifications/notification.routes';
+import { registerReferralRoutes } from './domains/referrals/referral.routes';
 import { registerMetricsRoute } from './routes/metrics.routes';
+import { registerReportRoutes } from './domains/reports/report.routes';
+import { registerPrivacyRoutes } from './domains/privacy/privacy.routes';
 import { registerQueryPerformanceRoutes } from './routes/query-performance.routes';
 import { registerJobRoutes } from './domains/jobs/jobs.routes';
+import { registerAssetRoutes } from './domains/assets/asset.routes';
+import { registerApm } from './lib/apm';
 import { closeQueues } from './lib/queue';
-import redisPool, { startRedisHealthCheck } from './lib/redisPool';
+import redisPool, { closeRedisPool, startRedisHealthCheck } from './lib/redisPool';
 import { emailNotificationWorker } from './lib/workers/email-notification.worker';
 import { initTokenBlacklist, closeTokenBlacklist } from './utils/token-blacklist';
 import { parseTrustProxy } from './config/rate-limit';
@@ -53,6 +54,20 @@ import { collectConfigWarnings, logConfigWarnings } from './config/warnings';
 import { logger } from './utils/logger';
 import { registerRateLimiting } from './plugins/rateLimit';
 import { registerResponseOptimization } from './plugins/responseOptimization';
+import { swaggerConfig } from './config/swagger';
+import { registerCsrfProtection } from './middleware/csrf';
+import { registerSecurityPlugins } from './plugins/security';
+import { registerApiVersioning } from './plugins/apiVersion';
+import { registerRequestTimeout } from './middleware/timeout';
+import { globalErrorHandler, notFoundHandler } from './middleware/error-handler';
+import { registerGraphQL } from './graphql/plugin';
+import { createCreatorTierRuntime } from './domains/creators/tier.runtime';
+import { registerRequestLogging } from './plugins/requestLogging';
+import { resolveRequestId } from './lib/requestContext';
+import {
+  startCacheInvalidationSubscriber,
+  stopCacheInvalidationSubscriber,
+} from './lib/cache/invalidation';
 
 // Behind a reverse proxy, TRUST_PROXY makes request.ip the real client
 // address instead of the proxy's, so per-IP rate limits don't bucket every
@@ -60,18 +75,19 @@ import { registerResponseOptimization } from './plugins/responseOptimization';
 const trustProxy = parseTrustProxy(config.TRUST_PROXY);
 
 const app = Fastify({
-  http2: config.HTTP2_ENABLED,
   trustProxy,
   genReqId: (request) => {
     const incoming = request.headers['x-request-id'];
-    return typeof incoming === 'string' && /^[A-Za-z0-9._:-]{1,128}$/.test(incoming)
-      ? incoming
-      : randomUUID();
+    return resolveRequestId(incoming, randomUUID);
   },
   logger: {
     level: config.LOG_LEVEL,
   },
-});
+}) as unknown as FastifyInstance;
+
+// Register before all application hooks/routes so context and response IDs
+// cover normal responses, validation failures, and unknown routes.
+registerRequestLogging(app);
 
 // Unsafe-but-valid settings (e.g. TRUST_PROXY=true) are reported together on
 // boot; see src/config/warnings.ts.
@@ -80,6 +96,7 @@ logConfigWarnings(logger, collectConfigWarnings());
 // Rate limiting (#1) classifies routes in an onRoute hook, so it must be
 // registered before any route is added.
 await registerRateLimiting(app);
+registerApm(app);
 await app.register(compress, {
   global: config.RESPONSE_COMPRESSION_ENABLED,
   encodings: ['br', 'gzip', 'deflate'],
@@ -91,6 +108,7 @@ registerResponseOptimization(app);
 // duration metrics, slow-query logging, short-lived read cache and unbounded
 // read detection. The returned client is a regular PrismaClient.
 const { client: prisma } = createInstrumentedPrismaClient();
+const creatorTiers = createCreatorTierRuntime(prisma);
 
 // Response schemas are documentation-only; see config/serialization.ts.
 applyJsonSerializer(app);
@@ -100,27 +118,45 @@ app.register(cookie, {
   secret: config.JWT_SECRET,
 });
 
+// CSRF protection (#191) must be added before routes so it covers them all.
+registerCsrfProtection(app);
+
 // Register routes
 registerAuthRoutes(app, prisma);
+registerTwoFactorRoutes(app, prisma);
 registerWalletRoutes(app, prisma);
 registerPaymentRoutes(app, prisma);
 registerUserRoutes(app, prisma);
+registerAuditLogRoutes(app, prisma);
 registerCreatorPayoutRoutes(app, prisma);
+registerScheduledPayoutRoutes(app, prisma);
 registerWebhookRoutes(app, prisma);
+registerDeveloperKeyRoutes(app, prisma);
+registerIncomingWebhookRoutes(app, prisma);
 registerAnalyticsRoutes(app, prisma);
 registerNotificationRoutes(app, prisma);
 registerAdminRoutes(app, prisma);
 registerRoleRoutes(app, prisma);
+registerMediaRoutes(app, prisma);
+registerModerationRoutes(app, prisma);
 registerMetricsRoute(app, prisma);
+registerReportRoutes(app, prisma);
+registerPrivacyRoutes(app, prisma);
+registerQueryPerformanceRoutes(app, prisma);
+registerJobRoutes(app, prisma);
 
 // Health check endpoint
-app.get('/health', async (_request, _reply) => {
+app.get('health', async (_request, _reply) => {
   const dbHealth = await checkDatabaseHealth();
   const poolMetrics = getPoolMetrics();
   const cb = getCircuitBreaker();
 
   const isHealthy = dbHealth.status === 'healthy';
   const isDegraded = dbHealth.status === 'degraded';
+
+  const heapUsagePercent = Math.round(
+    (process.memoryUsage().heapUsed / process.memoryUsage().heapTotal) * 100
+  );
 
   const checks = {
     status: isHealthy ? 'ok' : isDegraded ? 'degraded' : 'unhealthy',
@@ -153,6 +189,7 @@ app.get('/health', async (_request, _reply) => {
           slow_queries: stats.slowQueries,
           cache_hit_rate: stats.cache.hitRate,
           unbounded_reads: stats.unboundedReads,
+          top_slow_queries: stats.topSlowQueries,
         };
       })(),
       external_services: {
@@ -160,7 +197,7 @@ app.get('/health', async (_request, _reply) => {
       },
       memory: {
         status: 'healthy',
-        usage: `${Math.round((process.memoryUsage().heapUsed / process.memoryUsage().heapTotal) * 100)}%`,
+        usage: `${heapUsagePercent}%`,
       },
       nodejs: {
         version: process.version,
@@ -185,7 +222,7 @@ app.addHook('onReady', async () => {
   setServiceState('ready');
 });
 
-// Graceful shutdown (#23): flip readiness to `shutting_down` first so the
+// Graceful shutdown (##23): flip readiness to `shutting_down` first so the
 // readiness probe starts failing immediately (giving the load balancer a
 // chance to stop routing new traffic to this instance), then drain and
 // close everything in order: (1) stop accepting new connections and let
@@ -217,9 +254,10 @@ const shutdown = async (signal: 'SIGTERM' | 'SIGINT'): Promise<void> => {
     // sequence, including this step).
     await app.close();
     // Flush buffered creator usage counters before the database goes away.
-    await creatorTiers.close();
+    await stopCacheInvalidationSubscriber();
     await emailNotificationWorker.close();
     await closeQueues();
+    await closeRedisPool();
     await closeDatabase();
     await prisma.$disconnect();
     closeTokenBlacklist();
@@ -245,7 +283,14 @@ process.on('SIGINT', () => {
 const bootstrap = async (): Promise<void> => {
   await registerSecurityPlugins(app);
 
+  // Request timeout (#206): registered before any route-level hooks or
+  // handlers so the deadline covers the full request lifecycle, not just
+  // whatever runs after it.
+  registerRequestTimeout(app);
+
   await initTokenBlacklist(prisma);
+  initApiKeyAuth(prisma);
+  await startCacheInvalidationSubscriber();
 
   // API versioning (#25): validates an optional API-Version header against
   // SUPPORTED_API_VERSIONS and records per-version usage metrics. Existing
@@ -254,50 +299,28 @@ const bootstrap = async (): Promise<void> => {
   registerApiVersioning(app);
 
   registerAuthRoutes(app, prisma);
+  registerTwoFactorRoutes(app, prisma);
   registerWalletRoutes(app, prisma);
   registerPaymentRoutes(app, prisma);
   registerChargeRoutes(app, prisma);
   registerUserRoutes(app, prisma);
   registerCreatorPayoutRoutes(app, prisma);
+  registerScheduledPayoutRoutes(app, prisma);
   registerTeamRoutes(app, prisma);
-  registerWebhookRoutes(app, prisma);
-  registerAnalyticsRoutes(app, prisma);
-  registerAdminRoutes(app, prisma);
-  registerRoleRoutes(app, prisma);
-  registerMetricsRoute(app, prisma);
-  registerQueryPerformanceRoutes(app);
-  registerJobRoutes(app);
+  registerGraphQL(app);
+  registerAssetRoutes(app, prisma);
 
-  await registerGraphQL(app, prisma);
+  await initializeDatabase();
+  await startRedisHealthCheck();
+
+  await app.listen({ port: config.PORT, host: '0.0.0.0' });
+  app.log.info(`Server listening on port ${config.PORT}`);
+
+  // Wire the creator tier runtime into the request lifecycle.
+  await creatorTiers.start();
 };
 
-const start = async (): Promise<void> => {
-  try {
-    await bootstrap();
-
-    if (config.DATABASE_URL) {
-      try {
-        await initializeDatabase();
-      } catch (dbErr) {
-        app.log.warn({ dbErr }, 'Database pool initialization warning, continuing startup');
-      }
-    }
-
-    startRedisHealthCheck();
-
-    if (config.ENABLE_WORKERS || config.JOBS_WORKERS_ENABLED) {
-      const { startWorkers } = await import('./lib/workers/index');
-      startWorkers().catch((err) => {
-        app.log.error({ err }, 'Failed to start background workers');
-      });
-    }
-
-    await app.listen({ port: config.PORT, host: '0.0.0.0' });
-    app.log.info(`Server listening on http://0.0.0.0:${config.PORT}`);
-  } catch (err) {
-    app.log.error(err);
-    process.exit(1);
-  }
-};
-
-start();
+bootstrap().catch((err) => {
+  app.log.error(err, 'Failed to start server');
+  process.exit(1);
+});
